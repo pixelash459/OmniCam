@@ -42,15 +42,28 @@ log = logging.getLogger("omnicam.app")
 
 
 def get_local_ip(target: str) -> str:
-    """Best-effort local LAN IP used to reach ``target`` (for ``rtp_host``)."""
+    """Best-effort local LAN IP used to reach ``target`` (for ``rtp_host``).
+
+    UDP-connect trick: ``connect()`` a UDP socket to the phone and read the
+    chosen local address back with ``getsockname()`` — the OS then picks the
+    interface on the actual route to the phone, which stays correct on
+    multi-homed hosts (VPN/Tailscale/RustDesk, WSL/Docker/Hyper-V adapters,
+    multiple NICs).  Falls back to ``127.0.0.1`` if the trick fails.
+
+    Note: the phone treats ``rtp_host`` as advisory only and prefers the
+    control-connection peer address (PROTOCOL.md section 2.1).
+    """
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
         s.connect((target, 9))
-        return s.getsockname()[0]
+        ip = s.getsockname()[0]
+        if ip and ip != "0.0.0.0":
+            return ip
     except OSError:
-        return "127.0.0.1"
+        pass
     finally:
         s.close()
+    return "127.0.0.1"
 
 
 def apply_local_adjust(frame: np.ndarray, p: Dict[str, Any]) -> np.ndarray:
@@ -113,6 +126,7 @@ class OmniCamApp:
         self._camera = "back"
         self._conn_text = "disconnected"
         self._camera_caps: Dict[str, List[int]] = {}
+        self._rtp_host: Optional[str] = None   # media IP advertised in start (advisory)
 
         self._local_lock = threading.Lock()
         self._local_adjust: Dict[str, Any] = {"brightness": 0, "contrast": 0, "saturation": 100,
@@ -238,6 +252,12 @@ class OmniCamApp:
         """Application version string."""
         return __version__
 
+    @property
+    def rtp_host(self) -> Optional[str]:
+        """Local IP advertised as ``rtp_host`` in the last ``start`` (advisory:
+        the phone prefers the control TCP peer address for media)."""
+        return self._rtp_host
+
     def connect(self, ip: str) -> None:
         """Connect the control channel (and keep reconnecting) to ``ip``."""
         ip = ip.strip()
@@ -270,6 +290,9 @@ class OmniCamApp:
         self._vdec = VideoDecoder()
         self._last_video_rx_mono = 0.0
         rtp_host = get_local_ip(ip)
+        self._rtp_host = rtp_host
+        log.info("start: media destination rtp_host=%s (phone %s, advisory; "
+                 "phone prefers the control TCP peer address)", rtp_host, ip)
         video = {"port": VIDEO_PORT, "w": int(w), "h": int(h), "fps": int(fps),
                  "kbps": int(kbps), "keyint": 60}
         ok = self.control.send_start(rtp_host, video)

@@ -19,8 +19,8 @@ settings:
     PRODUCT_NAME: OmniCam
     TARGETED_DEVICE_FAMILY: "1"          # iPhone only (iPhone 6 Plus)
     CLANG_ENABLE_OBJC_ARC: "YES"         # pure Objective-C, no Swift
-    MARKETING_VERSION: "1.1.0"
-    CURRENT_PROJECT_VERSION: "1.1.0"
+    MARKETING_VERSION: "1.1.1"
+    CURRENT_PROJECT_VERSION: "1.1.1"
     ENABLE_BITCODE: "NO"
     # Code signing off (sideload target; ldid fake-signs the products)
     CODE_SIGNING_ALLOWED: "NO"
@@ -32,6 +32,10 @@ targets:
     type: application
     platform: iOS
     deploymentTarget: "12.0"
+    # Explicit link for the iOS 12 filter fix (EAGL-backed CIContext for buffer
+    # renders). Metal/MetalKit/CoreImage/VideoToolbox etc. auto-link via modules.
+    frameworks:
+      - OpenGLES
     sources:
       - path: ios/src
       - path: ios/Resources
@@ -44,13 +48,17 @@ targets:
         CFBundleDisplayName: OmniCam
         CFBundleExecutable: OmniCam
         CFBundleIdentifier: local.omnicam.app
+        CFBundleIcons:
+          CFBundlePrimaryIcon:
+            CFBundleIconFiles: [Icon-60, Icon-Small-40, Icon-Small]
+            UIPrerenderedIcon: true
         CFBundleInfoDictionaryVersion: "6.0"
         CFBundleName: OmniCam
         CFBundlePackageType: APPL
-        CFBundleShortVersionString: "1.1.0"
+        CFBundleShortVersionString: "1.1.1"
         CFBundleSignature: "????"
         CFBundleSupportedPlatforms: [iPhoneOS]
-        CFBundleVersion: "1.1.0"
+        CFBundleVersion: "1.1.1"
         LSRequiresIPhoneOS: true
         MinimumOSVersion: "12.0"
         UIDeviceFamily: [1]

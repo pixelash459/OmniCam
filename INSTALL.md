@@ -73,7 +73,9 @@ Both work the same way as Filza once AppSync is present; the file just travels o
 2. **Keep the ldid fake-signature.** AppSync accepts even fully unsigned binaries, but unsigned binaries are known to **crash at launch on iOS 12.4**. Always ship `ldid -S`-signed builds:
    - Path 1 (Theos) and Path 2 (workflow) already do this automatically.
    - Re-sign any existing .ipa/.app any time with: `bash scripts/fakesign.sh <OmniCam.ipa>`.
-3. **Allow the permission prompt on first run**: camera ("OmniCam streams the camera over Wi-Fi to your PC."). If you ever deny it: Settings → General → Reset → **Reset Location & Privacy**, then relaunch.
+3. **Icon**: after reinstalling v1.1.1+, the icon appears on its own. If an older install still shows a blank icon, run once in a phone terminal (NewTerm/MTerminal, as root):
+   `uicache -p "$(find /var/containers/Bundle/Application -name OmniCam.app -maxdepth 2)"` (or just `uicache -a`), then respring if needed.
+4. **Allow the permission prompt on first run**: camera ("OmniCam streams the camera over Wi-Fi to your PC."). If you ever deny it: Settings → General → Reset → **Reset Location & Privacy**, then relaunch.
 4. Streaming needs the phone and PC on the **same Wi-Fi network**. If your router has "AP/client isolation" enabled, discovery and streaming both fail (see troubleshooting).
 
 ---

@@ -644,7 +644,13 @@ class MainWindow(QMainWindow):
                 if not self._abr_check.isChecked():
                     # manual bitrate: tell the phone to disable auto ABR
                     self._app.set_bitrate(BITRATES_KBPS[self._kbps_combo.currentIndex()])
-                self._set_status("streaming")
+                # Show the advertised media IP: the phone may stream to the
+                # control-connection peer address instead of this rtp_host.
+                host = self._app.rtp_host
+                if host:
+                    self._set_status(f"streaming (rtp_host={host}; phone prefers control peer IP)")
+                else:
+                    self._set_status("streaming")
             elif kind == "stopped":
                 self._btn_start.setEnabled(self.control_connected())
                 self._btn_stop.setEnabled(False)

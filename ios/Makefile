@@ -14,7 +14,7 @@
 #     (its Package:/Version: fields name the produced packages/<...>.ipa).
 #
 # Build:  make package FINALPACKAGE=1      (see scripts/build-wsl.sh)
-# Output: packages/local.omnicam.app_1.1.0.ipa  (ldid fake-signed by Theos)
+# Output: packages/local.omnicam.app_1.1.1.ipa  (ldid fake-signed by Theos)
 
 TARGET = iphone:clang:12.4:12.0
 ARCHS = arm64
@@ -38,7 +38,7 @@ OmniCam_FILES = src/main.m \
 	src/OCNetManager.m \
 	src/OCFilterState.m
 
-OmniCam_FRAMEWORKS = UIKit Foundation AVFoundation CoreMedia CoreVideo VideoToolbox CoreImage Metal MetalKit
+OmniCam_FRAMEWORKS = UIKit Foundation AVFoundation CoreMedia CoreVideo VideoToolbox CoreImage Metal MetalKit OpenGLES
 
 OmniCam_CFLAGS = -fobjc-arc -Wno-deprecated-declarations
 

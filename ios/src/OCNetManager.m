@@ -585,6 +585,21 @@ static NSString *ocDeviceModel(void) {
     }
 }
 
+// IPv4 address of the connected TCP control peer, or nil. Runs on _clientQueue.
+// Re-queries getpeername() on the live accepted socket instead of only trusting
+// the cached _clientAddress so the value always matches the current connection.
+- (nullable NSString *)currentClientPeerIPv4 {
+    if (_clientSock == -1) return nil;
+    struct sockaddr_in peer;
+    memset(&peer, 0, sizeof peer);
+    socklen_t plen = sizeof peer;
+    char ip[INET_ADDRSTRLEN] = {0};
+    if (getpeername(_clientSock, (struct sockaddr *)&peer, &plen) != 0) return nil;
+    if (peer.sin_family != AF_INET) return nil;
+    if (!inet_ntop(AF_INET, &peer.sin_addr, ip, sizeof ip)) return nil;
+    return [NSString stringWithUTF8String:ip];
+}
+
 - (void)handleMessageStart:(NSDictionary *)m {
     NSString *host = [m valueForKey:@"rtp_host"];
     NSDictionary *video = [m valueForKey:@"video"];
@@ -599,8 +614,20 @@ static NSString *ocDeviceModel(void) {
     int kbps = (int)[self numIn:video key:@"kbps" def:3000];
     int keyint = (int)[self numIn:video key:@"keyint" def:60];
 
+    // Media destination: rtp_host is only advisory (PROTOCOL.md §2.1). On
+    // multi-homed Windows hosts (VPN/RustDesk/Tailscale, WSL/Docker/Hyper-V
+    // adapters, multiple NICs) the PC's guess of its own LAN IP is frequently
+    // wrong, so the UDP video would be fired into a dead address while TCP
+    // control still works. The TCP peer address of this very control
+    // connection is by definition a working route to the PC — prefer it,
+    // keep rtp_host as the fallback for protocol compatibility.
+    NSString *peerIP = [self currentClientPeerIPv4] ?: _clientAddress;
+    NSString *mediaHost = (peerIP.length > 0) ? peerIP : host;
+    NSLog(@"[OmniCam] start: media dest = %@ (from %@; rtp_host = %@)",
+          mediaHost, (peerIP.length > 0) ? @"TCP peer" : @"rtp_host fallback", host);
+
     NSError *err = nil;
-    BOOL ok = [self startStreamingToAddress:host videoPort:vPort
+    BOOL ok = [self startStreamingToAddress:mediaHost videoPort:vPort
                                        width:w height:h fps:fps kbps:kbps
                                       keyint:keyint error:&err];
     if (!ok) {

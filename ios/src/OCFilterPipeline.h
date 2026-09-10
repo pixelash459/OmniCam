@@ -1,10 +1,13 @@
 //
-//  OCFilterPipeline.h — Metal-backed Core Image filter chain.
+//  OCFilterPipeline.h — Core Image filter chain (EAGL buffer renders, Metal preview).
 //
 //  Frame path: OCCaptureEngine delegate input (NV12 CVPixelBuffer) → filter chain
 //  per DECISIONS.md order (geometry → adjust → look → LUT → stylize → beauty →
-//  overlay) → render into a CVPixelBuffer from the ENCODER's pool (fallback: own
-//  pool) → delegate. Identity states take a zero-copy pass-through path.
+//  overlay) → render into the pipeline's OWN GLES-compatible pool → delegate.
+//  Identity states take a zero-copy pass-through path.
+//  iOS 12 BUG 1 fix: buffer renders use an EAGL-backed CIContext (Metal into
+//  VT-pool buffers is not guaranteeable — AVCamFilter pattern); the Metal
+//  device/context is preview-only.
 #import <Foundation/Foundation.h>
 #import <CoreMedia/CoreMedia.h>
 #import <CoreVideo/CoreVideo.h>
@@ -33,7 +36,9 @@ NS_ASSUME_NONNULL_BEGIN
 
 @property (nonatomic, weak, nullable) id<OCFilterPipelineDelegate> delegate;
 @property (nonatomic, weak, nullable) id<OCFilterPipelinePreviewDelegate> previewDelegate;
-/// Provides the output CVPixelBufferPool (usually the encoder's). Weak.
+/// Historical: used to feed the encoder's CVPixelBufferPool to the pipeline.
+/// Since the iOS 12 EAGL fix, filtered frames render into the pipeline's own
+/// GLES-compatible pool instead; kept so the engine graph wiring stays intact.
 @property (nonatomic, weak, nullable) OCEncoder *encoder;
 
 @property (nonatomic, strong, readonly, nullable) id<MTLDevice> metalDevice;

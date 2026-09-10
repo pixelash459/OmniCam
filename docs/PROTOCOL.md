@@ -50,6 +50,18 @@ PC listens on `0.0.0.0:9920`, dedupes by source IP, refreshes a device list (dev
 {"t":"bye"}
 ```
 
+**`rtp_host` is advisory.** The phone sends RTP video to the **source address of
+the TCP control connection** (the address the PC actually connected from) when
+it can be determined, and only falls back to `rtp_host` if the peer address is
+unavailable. The PC MUST still send its best-guess LAN IP — computed with the
+UDP-connect trick (connect a UDP socket to the phone's IP, read `getsockname()`)
+— for backwards compatibility. Ports always come from `video.port`. Rationale:
+on multi-homed Windows hosts (VPN clients such as RustDesk/Tailscale, WSL/
+Docker/Hyper-V virtual adapters, multiple NICs) the PC's guess of its own LAN
+IP is often a dead address, which would send the UDP media stream into the void
+while TCP control keeps working; the TCP peer address is by definition a
+working route to the PC.
+
 ### 2.2 Messages Phone → PC
 
 ```jsonc

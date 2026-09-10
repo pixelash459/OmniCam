@@ -1,5 +1,5 @@
 //
-//  OCFilterPipeline.m — full CIFilter chain, encoder-pool rendering, overlay cache.
+//  OCFilterPipeline.m — full CIFilter chain, EAGL-rendered encoder output, overlay cache.
 //
 #import "OCFilterPipeline.h"
 #import "OCFilterState.h"
@@ -7,6 +7,7 @@
 #import "OCEncoder.h"
 
 #import <UIKit/UIKit.h> // UIGraphicsImageRenderer for the overlay bitmap
+#import <OpenGLES/EAGL.h> // BUG 1 FIX: EAGL-backed CIContext for buffer renders
 #import <mach/mach_time.h>
 
 static uint64_t ocNowMs(void) {
@@ -17,10 +18,19 @@ static uint64_t ocNowMs(void) {
 
 @interface OCFilterPipeline ()
 @property (nonatomic, strong) OCFilterState *state;
+// Metal backend: MTKView WYSIWYG preview ONLY (exposed to the view controller).
 @property (nonatomic, strong, nullable) id<MTLDevice> metalDevice;
 @property (nonatomic, strong, nullable) id<MTLCommandQueue> commandQueue;
 @property (nonatomic, strong) CIContext *ciContext;
+// BUG 1 FIX (iOS 12 device crash): EAGL-backed CIContext for CVPixelBuffer
+// renders. Rendering Metal into NV12 buffers from the VTCompressionSession pool
+// is not guaranteeable on iOS 12; Apple's AVCamFilter sample uses an OpenGL ES
+// context for exactly this pipeline.
+@property (nonatomic, strong, nullable) EAGLContext *eaglContext;
+@property (nonatomic, strong, nullable) CIContext *eaglCIContext;
 @property (nonatomic, assign) CGColorSpaceRef colorSpace;
+// Diagnostics throttle: logs the first successful filtered render only.
+@property (nonatomic, assign) BOOL loggedFirstFilteredRender;
 @property (nonatomic, strong) dispatch_queue_t renderQueue;
 @property (nonatomic, strong) OCLutLoader *lutLoader;
 @property (nonatomic, assign) double lastRenderMs;
@@ -29,16 +39,15 @@ static uint64_t ocNowMs(void) {
 @property (nonatomic, strong, nullable) CIImage *previewImage;
 @property (nonatomic, strong) NSLock *previewLock;
 
-// Destination fallback pool, recreated when dimensions change.
+// Destination pool for FILTERED frames, recreated when dimensions change.
+// BUG 1 FIX: its buffers carry kCVPixelBufferOpenGLESCompatibilityKey so the
+// EAGL-backed CIContext can render into them. The encoder's VTCompressionSession
+// pool is never used for filtered output anymore (Metal compat on VT-pool
+// buffers is unguaranteeable on iOS 12); identity frames never touch this pool
+// at all — capture buffers go straight to the encoder, zero-copy.
 @property (nonatomic, assign, nullable) CVPixelBufferPoolRef ownPool;
 @property (nonatomic, assign) size_t ownPoolWidth;
 @property (nonatomic, assign) size_t ownPoolHeight;
-// Cached handle on the encoder's pool (+1); avoids a per-frame sync hop to the
-// encoder queue. Re-fetched on dimension change and periodically as a safety net.
-@property (nonatomic, assign, nullable) CVPixelBufferPoolRef cachedPool CF_RETURNS_NOT_RETAINED;
-@property (nonatomic, assign) size_t cachedPoolWidth;
-@property (nonatomic, assign) size_t cachedPoolHeight;
-@property (nonatomic, assign) NSUInteger frameCounter;
 
 // Overlay cache: rebuilt when text / timecode second / frame width change.
 @property (nonatomic, strong, nullable) CIImage *overlayImage;
@@ -57,15 +66,47 @@ static uint64_t ocNowMs(void) {
     if (!self) return nil;
 
     _state = state;
+
+    // BUG 1 FIX (device crash): a Metal-backed CIContext rendering into NV12
+    // CVPixelBuffers from the VTCompressionSession pool is not guaranteed to
+    // work on iOS 12 — Apple's AVCamFilter sample uses an EAGL (OpenGL ES)
+    // context for exactly this pipeline. Filtered encoder-path renders therefore
+    // go through an EAGL-backed CIContext; the Metal context below is kept ONLY
+    // for the MTKView preview.
+    _eaglContext = [[EAGLContext alloc] initWithAPI:kEAGLRenderingAPIOpenGLES3];
+    if (!_eaglContext) {
+        // GLES3 context creation can fail on downlevel parts; GLES2 is the
+        // AVCamFilter-era floor and covers everything this chain renders.
+        _eaglContext = [[EAGLContext alloc] initWithAPI:kEAGLRenderingAPIOpenGLES2];
+    }
+    if (_eaglContext) {
+        _eaglCIContext = [CIContext contextWithEAGLContext:_eaglContext];
+    }
+
+    // Metal stays preview-only: it never renders into VT-pool buffers.
     _metalDevice = MTLCreateSystemDefaultDevice();
     if (_metalDevice) {
         _ciContext = [CIContext contextWithMTLDevice:_metalDevice];
         _commandQueue = [_metalDevice newCommandQueue];
-    } else {
-        // Metal-less fallback (should not happen on A8, but stay functional).
+    }
+    if (!_eaglCIContext && !_ciContext) {
+        // Neither backend initialized (should not happen on A8, but stay
+        // functional with a CPU CIContext).
         _ciContext = [CIContext contextWithOptions:nil];
     }
+
+    // Device RGB is correct for NV12 destinations: CI reads the buffer's format
+    // tag and performs the YCbCr conversion itself (no explicit BT.601/709 work).
     _colorSpace = CGColorSpaceCreateDeviceRGB();
+
+    // Diagnostics: confirm on-device which render backend is active (BUG 1 fix).
+    NSLog(@"[OCFilterPipeline] init: buffer renders via %@, preview via %@",
+          _eaglCIContext
+              ? [NSString stringWithFormat:@"EAGL CIContext (GLES%ld)",
+                    (long)(_eaglContext.API == kEAGLRenderingAPIOpenGLES3 ? 3 : 2)]
+              : @"software fallback CIContext",
+          _metalDevice ? @"Metal CIContext (MTKView only)" : @"none");
+
     _renderQueue = dispatch_queue_create("oc.filter.render", DISPATCH_QUEUE_SERIAL);
     _lutLoader = [[OCLutLoader alloc] init];
     _previewLock = [[NSLock alloc] init];
@@ -76,10 +117,15 @@ static uint64_t ocNowMs(void) {
 - (void)dealloc {
     if (_colorSpace) CGColorSpaceRelease(_colorSpace);
     if (_ownPool) CFRelease(_ownPool);
-    if (_cachedPool) CFRelease(_cachedPool);
 }
 
 - (CIContext *)ciContext { return _ciContext; }
+
+// CIContext used for CVPixelBuffer renders: EAGL-backed when available (the
+// iOS 12 fix), Metal/software only as a last-resort fallback.
+- (CIContext *)bufferRenderContext {
+    return _eaglCIContext ?: _ciContext;
+}
 
 - (void)clearLutCache {
     dispatch_async(_renderQueue, ^{
@@ -131,8 +177,34 @@ static uint64_t ocNowMs(void) {
         return;
     }
 
+    // Render bounds must never exceed the destination buffer — the rotate-90
+    // geometry swap can make the working extent outgrow dest. Intersect; if the
+    // intersection is empty, fall back to the unfiltered pass-through rather
+    // than letting CI write out of bounds.
+    CGRect dstBounds = CGRectMake(0, 0,
+                                  (CGFloat)CVPixelBufferGetWidth(dest),
+                                  (CGFloat)CVPixelBufferGetHeight(dest));
+    CGRect renderBounds = CGRectIntersection(wext, dstBounds);
+    if (CGRectIsEmpty(renderBounds)) {
+        CFRelease(dest); // acquired CF_RETURNS_RETAINED - do not leak it
+        if (d) [d filterPipeline:self didOutputPixelBuffer:input timestamp:ts];
+        [self setPreviewImage:inImage];
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [self notifyPreviewDelegate];
+        });
+        return;
+    }
+
     [self clearNV12:dest];
-    [_ciContext render:result toCVPixelBuffer:dest bounds:wext colorSpace:_colorSpace];
+    [[self bufferRenderContext] render:result toCVPixelBuffer:dest bounds:renderBounds colorSpace:_colorSpace];
+    if (!_loggedFirstFilteredRender) {
+        // Throttled diagnostics: fires once, proving the GLES render path works
+        // and naming the destination buffer dimensions.
+        _loggedFirstFilteredRender = YES;
+        NSLog(@"[OCFilterPipeline] first filtered frame rendered OK: dest %zux%zu px, context %@",
+              CVPixelBufferGetWidth(dest), CVPixelBufferGetHeight(dest),
+              _eaglCIContext ? @"EAGL" : @"software fallback");
+    }
     if (d) [d filterPipeline:self didOutputPixelBuffer:dest timestamp:ts];
     CFRelease(dest);
 
@@ -168,38 +240,14 @@ static uint64_t ocNowMs(void) {
 - (nullable CVPixelBufferRef)acquireDestinationBufferForInput:(CVPixelBufferRef)input CF_RETURNS_RETAINED {
     size_t w = CVPixelBufferGetWidth(input);
     size_t h = CVPixelBufferGetHeight(input);
-    _frameCounter++;
 
-    CVPixelBufferPoolRef pool = NULL;
-    BOOL dimsChanged = (_cachedPoolWidth != w || _cachedPoolHeight != h);
-    if (_cachedPool && !dimsChanged && (_frameCounter % 90) != 0) {
-        pool = _cachedPool;
-        CFRetain(pool);
-    } else {
-        if (_cachedPool) {
-            CFRelease(_cachedPool);
-            _cachedPool = NULL;
-        }
-        pool = [_encoder currentPixelBufferPool]; // +1
-        if (pool) {
-            _cachedPool = pool;
-            CFRetain(_cachedPool);
-            _cachedPoolWidth = w;
-            _cachedPoolHeight = h;
-        }
-    }
-
-    if (pool) {
-        if ([self pool:pool matchesWidth:w height:h]) {
-            CVPixelBufferRef out = NULL;
-            if (CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, pool, &out) == kCVReturnSuccess) {
-                CFRelease(pool);
-                return out;
-            }
-        }
-        CFRelease(pool);
-    }
-
+    // BUG 1 FIX: filtered frames render into the OWN pool, whose buffers are
+    // created with kCVPixelBufferOpenGLESCompatibilityKey so the EAGL-backed
+    // CIContext can draw into them. The encoder's VTCompressionSession pool is
+    // never used for filtered frames — Metal compat on VT-pool buffers is
+    // unguaranteeable on iOS 12 (AVCamFilter pattern). This method is only
+    // reached when filtering is active; identity frames hand the capture buffer
+    // straight to the encoder (zero-copy, no pool here).
     if (!_ownPool || _ownPoolWidth != w || _ownPoolHeight != h) {
         if (_ownPool) {
             CFRelease(_ownPool);
@@ -225,23 +273,14 @@ static uint64_t ocNowMs(void) {
             return out;
         }
     }
+    // Pool exhausted/unavailable: the caller ships the frame unfiltered instead
+    // of dropping it.
     return NULL;
 }
 
-- (BOOL)pool:(CVPixelBufferPoolRef)pool matchesWidth:(size_t)w height:(size_t)h {
-    CFDictionaryRef attrs = CVPixelBufferPoolGetPixelBufferAttributes(pool);
-    if (!attrs) return NO;
-    CFNumberRef wn = CFDictionaryGetValue(attrs, kCVPixelBufferWidthKey);
-    CFNumberRef hn = CFDictionaryGetValue(attrs, kCVPixelBufferHeightKey);
-    if (!wn || !hn) return NO;
-    long pw = 0, ph = 0;
-    CFNumberGetValue(wn, kCFNumberLongType, &pw);
-    CFNumberGetValue(hn, kCFNumberLongType, &ph);
-    return (size_t)pw == w && (size_t)ph == h;
-}
-
-// Encoder-pool buffers are recycled; stale content would ghost into frames whose
-// filter chain leaves gaps (e.g. zoom-out / rotation), so pre-fill legal NV12 black.
+// Destination-pool buffers are recycled; stale content would ghost into frames
+// whose filter chain leaves gaps (e.g. zoom-out / rotation), so pre-fill legal
+// NV12 black.
 - (void)clearNV12:(CVPixelBufferRef)buf {
     if (CVPixelBufferLockBaseAddress(buf, 0) != kCVReturnSuccess) return;
     uint8_t *y = CVPixelBufferGetBaseAddressOfPlane(buf, 0);
@@ -589,10 +628,19 @@ static uint64_t ocNowMs(void) {
         CGRect wext = CGRectZero;
         CIImage *result = [self processImage:inImage state:state outExtent:&wext];
         CGRect dst = CGRectMake(0, 0, (CGFloat)CVPixelBufferGetWidth(output), (CGFloat)CVPixelBufferGetHeight(output));
+        // Bounds must never exceed the destination buffer (rotate-90 swaps w/h).
+        // Empty intersection → unfiltered pass-through instead of an out-of-
+        // bounds render.
         CGRect bounds = CGRectIntersection(wext, dst);
-        if (CGRectIsEmpty(bounds)) return;
+        CIImage *toRender = result;
+        if (CGRectIsEmpty(bounds)) {
+            bounds = CGRectIntersection(inImage.extent, dst);
+            toRender = inImage;
+            if (CGRectIsEmpty(bounds)) return;
+        }
         [self clearNV12:output];
-        [self->_ciContext render:result toCVPixelBuffer:output bounds:bounds colorSpace:self->_colorSpace];
+        // EAGL-backed context (BUG 1 fix); Metal never renders into NV12 buffers.
+        [[self bufferRenderContext] render:toRender toCVPixelBuffer:output bounds:bounds colorSpace:self->_colorSpace];
     });
 }
 

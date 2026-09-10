@@ -260,6 +260,10 @@ static UIColor *OCAccent(void) {
         _mtkView = [[MTKView alloc] initWithFrame:self.view.bounds device:_pipeline.metalDevice];
         _mtkView.colorPixelFormat = MTLPixelFormatBGRA8Unorm;
         _mtkView.framebufferOnly = NO; // CIContext must render into the drawable
+        // BUG 1 diagnostics: must print 0 — YES would make the preview render
+        // (CIContext render:toMTLTexture:) fail on every drawable.
+        NSLog(@"[OCViewController] MTKView framebufferOnly=%d (must be 0)",
+              (int)_mtkView.framebufferOnly);
         _mtkView.paused = YES;
         _mtkView.enableSetNeedsDisplay = YES; // we drive redraws per captured frame
         _mtkView.delegate = self;
