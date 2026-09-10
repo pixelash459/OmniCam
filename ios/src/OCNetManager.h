@@ -17,7 +17,7 @@ extern const int OCVideoPort;    // 9921
 extern const int OCControlPort;  // 9923
 
 extern NSString * const OCMagicString;       // "OMNICAM1"
-extern NSString * const OCAppVersionString;  // "1.2.1"
+extern NSString * const OCAppVersionString;  // "1.2.2"
 
 @class OCNetManager, OCCaptureEngine, OCEncoder, OCPacker;
 

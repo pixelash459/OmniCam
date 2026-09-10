@@ -16,10 +16,11 @@ is defensive so the window works without that module (feature disabled).
 from __future__ import annotations
 
 import logging
+import signal
 import sys
 from typing import Any, Dict, List, Optional, Tuple
 
-from PySide6.QtCore import QByteArray, Qt, QTimer
+from PySide6.QtCore import QByteArray, Qt, QTimer, Signal
 from PySide6.QtGui import QImage, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
@@ -39,6 +40,7 @@ from PySide6.QtWidgets import (
     QPushButton,
     QScrollArea,
     QSlider,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
@@ -46,6 +48,7 @@ from PySide6.QtWidgets import (
 from omnicam import __version__
 from omnicam import ui_theme as T
 from omnicam.app import OmniCamApp
+from omnicam.tray import TrayIcon, load_app_icon
 from omnicam.ui_theme import app_font, make_dark_palette  # noqa: F401 (re-export)
 from omnicam.ui_widgets import FormGrid, PreviewWidget, Section, SliderRow, StatsStrip
 from omnicam.virtualcam_out import VirtualCamError
@@ -78,16 +81,32 @@ PREF_GEOMETRY = "window.geometry"
 PREF_FILTERS_OPEN = "ui.filters_open"
 PREF_LOCAL_OPEN = "ui.local_open"
 PREF_STATS_DETAILS = "ui.stats_details"
+PREF_CLOSE_TO_TRAY = "ui.close_to_tray"
 
 
 class MainWindow(QMainWindow):
-    """OmniCam PC main window."""
+    """OmniCam PC main window.
+
+    Closing with the title-bar X hides the window into the system tray (pref
+    ``ui.close_to_tray``, default on) so streaming and the virtual camera keep
+    running; "Quit OmniCam" (tray menu or the status-bar Quit button) performs
+    the full shutdown.  ``shutdown_finished`` fires once after that shutdown
+    so ``main()`` can quit the application (``quitOnLastWindowClosed`` is off).
+    """
+
+    shutdown_finished = Signal()
 
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle(f"OmniCam PC {__version__}")
+        self.setWindowIcon(load_app_icon())
         self.resize(1280, 800)
         self.setMinimumSize(1100, 700)
+
+        self._quitting = False
+        self._shutdown_done = False
+        self._tray_hint_shown = False
+        self._tray: Optional[TrayIcon] = None
 
         self._app = OmniCamApp()
         self._app.start()
@@ -107,6 +126,7 @@ class MainWindow(QMainWindow):
         self._connect_ip: Optional[str] = None  # last IP we asked to connect to
 
         self._build_ui()
+        self._build_tray()
         self._restore_prefs()
         self._build_timers()
         self._show_import_warnings()
@@ -192,6 +212,89 @@ class MainWindow(QMainWindow):
         bar.addWidget(self._status_rtt)
         bar.addWidget(self._status_msg, 1)
         bar.addPermanentWidget(self._status_ver)
+        bar.addPermanentWidget(self._build_quit_button())
+
+    def _build_quit_button(self) -> QToolButton:
+        """Subtle text-only Quit in the status bar (X only hides to the tray)."""
+        btn = QToolButton(self)
+        btn.setObjectName("quitButton")
+        btn.setText("Quit")
+        btn.setAutoRaise(True)
+        btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn.setToolTip("Quit OmniCam completely (stops streaming and the virtual camera)")
+        btn.setStyleSheet(
+            f"QToolButton#quitButton {{ color: {T.TEXT_MUTED}; border: 1px solid transparent;"
+            f" border-radius: {T.RADIUS}px; padding: 1px 8px; background: transparent; }}"
+            f"QToolButton#quitButton:hover {{ color: {T.TEXT}; background-color: {T.HOVER};"
+            f" border-color: {T.INPUT_BORDER}; }}"
+            f"QToolButton#quitButton:pressed {{ background-color: {T.PRESSED}; }}")
+        btn.clicked.connect(self.quit_app)
+        self._btn_quit = btn
+        return btn
+
+    # -- system tray -------------------------------------------------------
+    def _build_tray(self) -> None:
+        """Create the tray icon; shown only when the platform offers a tray."""
+        close_to_tray = bool(self._pref_get(PREF_CLOSE_TO_TRAY, True))
+        tray = TrayIcon(self, close_to_tray=close_to_tray)
+        tray.show_requested.connect(self.show_from_tray)
+        tray.toggle_requested.connect(self.toggle_from_tray)
+        tray.start_stream.connect(self._on_start_stream)
+        tray.stop_stream.connect(self._on_stop_stream)
+        tray.start_vcam.connect(self._on_vcam_start)
+        tray.stop_vcam.connect(self._on_vcam_stop)
+        tray.close_to_tray_changed.connect(self._on_close_to_tray_toggled)
+        tray.quit_requested.connect(self.quit_app)
+        tray.menu.aboutToShow.connect(self._update_tray_state)
+        self._tray = tray
+        self._update_tray_state()
+        if TrayIcon.available():
+            tray.show()
+
+    def tray(self) -> Optional[TrayIcon]:
+        """The tray controller (always created; visible only with a real tray)."""
+        return self._tray
+
+    def close_to_tray_enabled(self) -> bool:
+        return bool(self._pref_get(PREF_CLOSE_TO_TRAY, True))
+
+    def _on_close_to_tray_toggled(self, on: bool) -> None:
+        self._pref_set(PREF_CLOSE_TO_TRAY, bool(on))
+
+    def _tray_status_text(self) -> str:
+        conn = self._status_conn.text()
+        if self._app.streaming and "streaming" not in conn:
+            conn += " · streaming"
+        if self._app.vcam.running:
+            conn += " · virtual camera on"
+        msg = self._status_msg.text().strip()
+        return f"OmniCam PC — {conn}" + (f"\n{msg}" if msg else "")
+
+    def _update_tray_state(self) -> None:
+        if self._tray is None:
+            return
+        try:
+            self._tray.set_state(
+                self._tray_status_text(),
+                streaming=bool(self._app.streaming),
+                can_start_stream=self._btn_start.isEnabled(),
+                can_stop_stream=self._btn_stop.isEnabled(),
+                can_start_vcam=self._btn_vcam_start.isEnabled(),
+                can_stop_vcam=self._btn_vcam_stop.isEnabled(),
+            )
+        except RuntimeError:  # tray already destroyed during shutdown
+            pass
+
+    def show_from_tray(self) -> None:
+        self.showNormal()
+        self.raise_()
+        self.activateWindow()
+
+    def toggle_from_tray(self) -> None:
+        if self.isVisible() and not self.isMinimized():
+            self.hide()
+        else:
+            self.show_from_tray()
 
     def _build_sidebar(self) -> QWidget:
         scroll = QScrollArea(self)
@@ -898,6 +1001,7 @@ class MainWindow(QMainWindow):
         self._btn_vcam_stop.setEnabled(True)
         self._vcam_backend.setText(backend)
         self._vcam_status.setText(f"running on backend '{backend}'")
+        self._update_tray_state()
 
     def _on_vcam_stop(self) -> None:
         self._app.stop_virtual_cam()
@@ -906,6 +1010,7 @@ class MainWindow(QMainWindow):
         self._vcam_backend.setText("-")
         self._vcam_res.setText("-")
         self._vcam_fps.setText("-")
+        self._update_tray_state()
 
     # ------------------------------------------------------------------
     # local adjust
@@ -1021,9 +1126,16 @@ class MainWindow(QMainWindow):
         st = self._status_conn.style()
         st.unpolish(self._status_conn)
         st.polish(self._status_conn)
+        self._update_tray_state()
 
     def _poll_events(self) -> None:
-        for kind, payload in self._app.drain_events():
+        events = self._app.drain_events()
+        if events:
+            self._handle_events(events)
+            self._update_tray_state()  # button enabling may have changed
+
+    def _handle_events(self, events: Any) -> None:
+        for kind, payload in events:
             if kind == "state":
                 connected = bool(payload.get("connected"))
                 text = str(payload.get("text", ""))
@@ -1300,16 +1412,58 @@ class MainWindow(QMainWindow):
 
     def _set_status(self, text: str) -> None:
         self._status_msg.setText(text)
+        self._update_tray_state()
 
     # ------------------------------------------------------------------
+    # close / hide-to-tray / quit
+    # ------------------------------------------------------------------
+    def _should_close_to_tray(self) -> bool:
+        if self._quitting or self._tray is None or not self._tray.is_visible():
+            return False
+        app = QApplication.instance()
+        if app is not None and getattr(app, "isSavingSession", lambda: False)():
+            return False  # Windows log-off / shutdown: really close
+        return self.close_to_tray_enabled()
+
     def closeEvent(self, event: Any) -> None:
-        """Graceful shutdown of every thread and socket."""
+        """X hides to the tray (when enabled); otherwise full graceful shutdown."""
+        if self._should_close_to_tray():
+            event.ignore()
+            self.hide()
+            if not self._tray_hint_shown and self._tray is not None:
+                self._tray_hint_shown = True
+                self._tray.show_message(
+                    "OmniCam is still running",
+                    "Streaming and the virtual camera keep working. "
+                    "Right-click the tray icon to quit.", 4000)
+            return
+        self.shutdown()
+        super().closeEvent(event)
+
+    def shutdown(self) -> None:
+        """Idempotent full teardown: geometry pref, app threads/sockets, tray icon."""
+        if self._shutdown_done:
+            return
+        self._shutdown_done = True
+        self._quitting = True
         self._save_geometry_pref()
         try:
             self._app.shutdown()
         except Exception:
             log.exception("shutdown failed")
-        super().closeEvent(event)
+        if self._tray is not None:
+            self._tray.destroy()
+            self._tray = None
+        self.shutdown_finished.emit()
+
+    def quit_app(self) -> None:
+        """Permanent close: full shutdown, then quit the Qt application."""
+        self._quitting = True
+        self.close()  # closeEvent -> shutdown() (no-op if already done)
+        self.shutdown()
+        app = QApplication.instance()
+        if app is not None:
+            QTimer.singleShot(0, app.quit)
 
 
 def apply_theme(app: QApplication) -> None:
@@ -1326,8 +1480,22 @@ def main() -> int:
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     app = QApplication(sys.argv)
+    app.setApplicationName("OmniCam PC")
+    app.setQuitOnLastWindowClosed(False)  # hiding into the tray must not exit
     apply_theme(app)
+    app.setWindowIcon(load_app_icon())
     win = MainWindow()
+    win.setWindowIcon(load_app_icon())
+    # Full close (Quit, or X with close-to-tray off) ends the process.
+    win.shutdown_finished.connect(lambda: QTimer.singleShot(0, app.quit))
+    # Session end / app.quit() from anywhere still tears everything down once.
+    app.aboutToQuit.connect(win.shutdown)
+    # Ctrl+C in a console: the window's timers keep the interpreter ticking so
+    # Python delivers the signal; quit_app() then runs the normal shutdown.
+    try:
+        signal.signal(signal.SIGINT, lambda *_: QTimer.singleShot(0, win.quit_app))
+    except (ValueError, OSError):  # pragma: no cover - not the main thread
+        pass
     win.show()
     return app.exec()
 

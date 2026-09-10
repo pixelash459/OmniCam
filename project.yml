@@ -19,8 +19,8 @@ settings:
     PRODUCT_NAME: OmniCam
     TARGETED_DEVICE_FAMILY: "1"          # iPhone only (iPhone 6 Plus)
     CLANG_ENABLE_OBJC_ARC: "YES"         # pure Objective-C, no Swift
-    MARKETING_VERSION: "1.2.1"
-    CURRENT_PROJECT_VERSION: "1.2.1"
+    MARKETING_VERSION: "1.2.2"
+    CURRENT_PROJECT_VERSION: "1.2.2"
     ENABLE_BITCODE: "NO"
     # Code signing off (sideload target; ldid fake-signs the products)
     CODE_SIGNING_ALLOWED: "NO"
@@ -55,10 +55,10 @@ targets:
         CFBundleInfoDictionaryVersion: "6.0"
         CFBundleName: OmniCam
         CFBundlePackageType: APPL
-        CFBundleShortVersionString: "1.2.1"
+        CFBundleShortVersionString: "1.2.2"
         CFBundleSignature: "????"
         CFBundleSupportedPlatforms: [iPhoneOS]
-        CFBundleVersion: "1.2.1"
+        CFBundleVersion: "1.2.2"
         LSRequiresIPhoneOS: true
         MinimumOSVersion: "12.0"
         UIDeviceFamily: [1]

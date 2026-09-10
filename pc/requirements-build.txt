@@ -1,0 +1,5 @@
+# Build-only tools for build-exe.bat (NOT needed to run OmniCam from source).
+# pillow      : packaging\make_icon.py renders omnicam.ico / omnicam.png
+# pyinstaller : freezes the onedir tree consumed by packaging\OmniCam.iss
+pillow>=10
+pyinstaller>=6

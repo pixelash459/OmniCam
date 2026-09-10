@@ -12,11 +12,18 @@ binaries += b
 hiddenimports += h
 
 binaries += collect_dynamic_libs("av")
+
+# Window/taskbar/tray icon, shipped as a data file so omnicam.app_icon can load
+# it at runtime (the --icon exe resource alone is not reachable from Qt).
+# Lands in dist\OmniCam\_internal\omnicam.ico (== sys._MEIPASS in onedir).
+datas += [("packaging\\omnicam.ico", "."), ("packaging\\omnicam.png", ".")]
+
 hiddenimports += [
     "av",
     "numpy",
     "omnicam",
     "omnicam.ui",
+    "omnicam.app_icon",
     "omnicam.net",
     "omnicam.app",
     "omnicam.decoder",

@@ -2,7 +2,7 @@
 rem Build a standalone OmniCam PC tree + Inno Setup installer.
 rem Output:
 rem   pc\dist\OmniCam\OmniCam.exe     (portable onedir)
-rem   dist\OmniCam-PC-1.2.1-Setup.exe (this repo's dist\, double-click installer)
+rem   dist\OmniCam-PC-1.2.2-Setup.exe (this repo's dist\, double-click installer)
 setlocal EnableExtensions
 cd /d "%~dp0"
 
@@ -11,13 +11,18 @@ if not exist ".venv\Scripts\python.exe" (
     exit /b 1
 )
 
-echo ==^> icon
-".venv\Scripts\python.exe" packaging\make_icon.py || exit /b 1
-
+".venv\Scripts\python.exe" -c "import PIL" >nul 2>&1
+if errorlevel 1 (
+    echo ==^> installing build tools ^(requirements-build.txt^)
+    ".venv\Scripts\python.exe" -m pip install -q -r requirements-build.txt || exit /b 1
+)
 if not exist ".venv\Scripts\pyinstaller.exe" (
     echo ==^> installing PyInstaller
-    ".venv\Scripts\python.exe" -m pip install -q pyinstaller || exit /b 1
+    ".venv\Scripts\python.exe" -m pip install -q -r requirements-build.txt || exit /b 1
 )
+
+echo ==^> icon  ^(packaging\omnicam.ico + omnicam.png; bundled via OmniCam.spec datas^)
+".venv\Scripts\python.exe" packaging\make_icon.py || exit /b 1
 
 echo ==^> PyInstaller onedir
 if exist dist\OmniCam rd /s /q dist\OmniCam
@@ -49,5 +54,5 @@ echo ==^> Inno Setup  "%ISCC%"
 echo.
 echo Done:
 echo   %~dp0dist\OmniCam\OmniCam.exe
-echo   %~dp0..\dist\OmniCam-PC-1.2.1-Setup.exe
+echo   %~dp0..\dist\OmniCam-PC-1.2.2-Setup.exe
 endlocal
