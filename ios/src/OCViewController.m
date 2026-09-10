@@ -739,8 +739,7 @@ static UIColor *OCAccent(void) {
 
 - (void)resChanged:(UISegmentedControl *)seg {
     BOOL hd = (seg.selectedSegmentIndex == 1);
-    [_captureEngine setWantsHighResolution:hd];
-    [_netManager notifyLocalResolutionHD:hd]; // §6 defaults + push session
+    [_netManager notifyLocalResolutionHD:hd];
 }
 
 - (void)abrToggled:(UISwitch *)sw {

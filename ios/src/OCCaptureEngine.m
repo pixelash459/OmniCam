@@ -183,17 +183,33 @@
 }
 
 - (void)setWantsHighResolution:(BOOL)hd {
-    dispatch_sync(_sessionQueue, ^{
-        if (_wantsHighResolution == hd) return;
-        _wantsHighResolution = hd;
-        if (_session.running && [_activeCameraId isEqualToString:@"back"]) {
+    [self setWantsHighResolution:hd completion:nil];
+}
+
+- (void)setWantsHighResolution:(BOOL)hd completion:(void (^)(void))completion {
+    self->_wantsHighResolution = hd;
+    dispatch_async(_sessionQueue, ^{
+        if (self->_session.running && [self->_activeCameraId isEqualToString:@"back"]) {
             NSString *preset = [self desiredPreset];
-            if ([_session canSetSessionPreset:preset]) {
-                [_session beginConfiguration];
-                _session.sessionPreset = preset;
-                [_session commitConfiguration];
-                NSLog(@"[OmniCam] capture preset -> %@", preset);
+            if ([self->_session canSetSessionPreset:preset]
+                && ![self->_session.sessionPreset isEqualToString:preset]) {
+                self->_reconfiguring = YES;
+                @try {
+                    [self->_session beginConfiguration];
+                    self->_session.sessionPreset = preset;
+                    [self->_session commitConfiguration];
+                    NSLog(@"[OmniCam] capture preset -> %@", preset);
+                } @catch (NSException *ex) {
+                    NSLog(@"[OmniCam] capture preset exception: %@", ex);
+                    @try { [self->_session commitConfiguration]; } @catch (NSException *ex2) {}
+                } @finally {
+                    self->_reconfiguring = NO;
+                }
             }
+        }
+        void (^cb)(void) = completion;
+        if (cb) {
+            dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), cb);
         }
     });
 }

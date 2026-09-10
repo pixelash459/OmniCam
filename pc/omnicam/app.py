@@ -557,6 +557,14 @@ class OmniCamApp:
         fps = self._stream_cfg["fps"]
         self.video_rx.set_session(ssrc_video, ip or "255.255.255.255", fps)
         self._streaming = True
+        self._drain_video_queue()
+        with self._vdec_lock:
+            old, self._vdec = self._vdec, VideoDecoder()
+        if old is not None:
+            try:
+                old.close()
+            except Exception:
+                pass
         # PLI right away so the first IDR arrives promptly
         self.video_rx.force_pli("start")
         self._emit("started", {"ssrc_video": ssrc_video,

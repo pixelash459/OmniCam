@@ -46,9 +46,11 @@ NS_ASSUME_NONNULL_BEGIN
 /// Re-starts after app interruptions (didBecomeActive).
 - (void)ensureRunning;
 
-/// Requests 1920x1080 preset for the next (re)configuration. Only applied while the
-/// back camera is active — front caps at 720p (DECISIONS.md).
+/// Requests 1920x1080 preset. Front is ignored (stays 720p). Completion runs
+/// after the AVCapture commit (any thread). Never call from the session queue
+/// with a completion that dispatch_sync's back here.
 - (void)setWantsHighResolution:(BOOL)hd;
+- (void)setWantsHighResolution:(BOOL)hd completion:(void (^_Nullable)(void))completion;
 
 /// Instant single-session switch. Completion fires on the main queue.
 - (void)switchToCameraId:(NSString *)cameraId

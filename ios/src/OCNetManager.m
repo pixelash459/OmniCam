@@ -24,7 +24,7 @@ const int OCVideoPort   = 9921;
 const int OCControlPort = 9923;
 
 NSString * const OCMagicString      = @"OMNICAM1";
-NSString * const OCAppVersionString = @"1.1.9";
+NSString * const OCAppVersionString = @"1.1.10";
 
 static const NSUInteger OCMaxLineBytes = 64 * 1024; // §2 max message 64 KiB
 static const double OCAbrFloorKbps = 500.0;         // §6
@@ -69,6 +69,7 @@ static NSString *ocDeviceModel(void) {
     BOOL _applyingRemoteFilter; // suppress echoing a PC-pushed state back
     BOOL _applyingRemoteSession; // suppress echoing a PC-pushed §2.3 session
     int _sessionW, _sessionH, _sessionFps, _sessionKbps; // intended encode session
+    unsigned _retargetGen; // live 720↔1080; completion ignores superseded gens
 
     // stats deltas
     uint32_t _lastFrames, _lastSent, _lastResent;
@@ -90,6 +91,7 @@ static NSString *ocDeviceModel(void) {
 @property (nonatomic, copy) NSString *deviceModel;
 @property (nonatomic, strong) dispatch_queue_t mediaQueue; // start/stop — never block TCP
 - (void)haltStreamLockedNotifyPC:(BOOL)notifyPC;
+- (void)retargetLiveEncode;
 - (void)applyRemoteSessionFields:(NSDictionary *)state;
 @end
 
@@ -721,6 +723,9 @@ static BOOL ocTcpSendAll(int fd, const uint8_t *p, size_t left) {
         if (!err) {
             OCEncoder *enc = self->_encoder;
             if (enc) [enc forceKeyframe];
+            if (self->_streaming) {
+                dispatch_async(self->_mediaQueue, ^{ [self retargetLiveEncode]; });
+            }
         }
         dispatch_async(self->_clientQueue, ^{
             if (!err) {
@@ -893,7 +898,6 @@ static BOOL ocTcpSendAll(int fd, const uint8_t *p, size_t left) {
             [self setBitrateCeilingKbps:3000];
         }
     }
-    if (ce) [ce setWantsHighResolution:(_sessionH > 720 || _sessionW > 1280)];
 
     if ([state[@"zoom"] isKindOfClass:[NSNumber class]] && ce) {
         [ce setZoomFactor:(CGFloat)[state[@"zoom"] doubleValue]];
@@ -903,19 +907,19 @@ static BOOL ocTcpSendAll(int fd, const uint8_t *p, size_t left) {
         [ce applyTorchOn:wantTorch];
     }
 
-    BOOL encodeChanged = (_sessionW != oldW || _sessionH != oldH
-                          || _sessionFps != oldFps || _sessionKbps != oldKbps);
+    BOOL encodeChanged = (_sessionW != oldW || _sessionH != oldH || _sessionFps != oldFps);
+    BOOL kbpsChanged = (_sessionKbps != oldKbps);
     if (_streaming && encodeChanged) {
-        NSError *err = nil;
-        BOOL ok = [self startStreamingToConnectedClientWidth:_sessionW
-                                                      height:_sessionH
-                                                         fps:_sessionFps
-                                                        kbps:_sessionKbps
-                                                      keyint:60
-                                                       error:&err];
-        if (!ok) {
-            NSLog(@"[OmniCam] session encoder restart failed: %@", err);
-            [self failOnMain:err.localizedDescription ?: @"Stream restart failed"];
+        if (!dispatch_get_specific(kOCMediaQueueKey)) {
+            dispatch_async(_mediaQueue, ^{ [self retargetLiveEncode]; });
+        } else {
+            [self retargetLiveEncode];
+        }
+    } else {
+        if (ce) [ce setWantsHighResolution:(_sessionH > 720 || _sessionW > 1280)];
+        if (_streaming && kbpsChanged) {
+            OCEncoder *e = _encoder;
+            if (e) [e setBitrateKbps:_sessionKbps];
         }
     }
 }
@@ -1242,12 +1246,67 @@ static BOOL ocTcpSendAll(int fd, const uint8_t *p, size_t left) {
 - (void)notifyLocalResolutionHD:(BOOL)hd {
     OCCaptureEngine *ce = _captureEngine;
     if (hd && ce && [ce.activeCameraId isEqualToString:@"front"]) hd = NO;
+    int oldW = _sessionW, oldH = _sessionH;
     _sessionW = hd ? 1920 : 1280;
     _sessionH = hd ? 1080 : 720;
     _sessionFps = 30;
     _sessionKbps = hd ? 6000 : 3000;
     [self setBitrateCeilingKbps:_sessionKbps];
+    if (_streaming && (oldW != _sessionW || oldH != _sessionH)) {
+        if (!dispatch_get_specific(kOCMediaQueueKey)) {
+            dispatch_async(_mediaQueue, ^{ [self retargetLiveEncode]; });
+        } else {
+            [self retargetLiveEncode];
+        }
+    } else if (ce) {
+        [ce setWantsHighResolution:hd];
+    }
     [self pushSessionState];
+}
+
+/// Live 720↔1080: pause VT, change capture preset off this queue, then recreate
+/// the encoder in place. Never halt the stream / drop TCP / dispatch_sync capture.
+- (void)retargetLiveEncode {
+    if (!_streaming) return;
+    OCEncoder *enc = _encoder;
+    OCPacker *pk = _packer;
+    OCCaptureEngine *ce = _captureEngine;
+    if (!enc || !pk || !ce) return;
+
+    unsigned gen = ++_retargetGen;
+    [enc pauseEncoding];
+    BOOL hd = (_sessionH > 720 || _sessionW > 1280);
+    int w = _sessionW, h = _sessionH, fps = _sessionFps, kbps = _sessionKbps;
+    __weak typeof(self) wself = self;
+    [ce setWantsHighResolution:hd completion:^{
+        __strong typeof(self) sself = wself;
+        if (!sself) return;
+        dispatch_async(sself->_mediaQueue, ^{
+            if (!sself->_streaming) return;
+            if (sself->_retargetGen != gen) return; // a newer 720↔1080 won
+            NSError *err = nil;
+            OCEncoder *e = sself->_encoder;
+            OCPacker *p = sself->_packer;
+            if (!e || !p) return;
+            if (![e startWithWidth:w height:h fps:fps bitrateKbps:kbps keyint:60 error:&err]) {
+                NSLog(@"[OmniCam] live retarget failed: %@", err);
+                [sself failOnMain:err.localizedDescription ?: @"Resolution change failed"];
+                return;
+            }
+            [p beginStream];
+            sself->_streamWidth = w;
+            sself->_streamHeight = h;
+            sself->_fps = fps;
+            [e forceKeyframe];
+            [sself sendJson:@{
+                @"t" : @"started",
+                @"ssrc_video" : @(p.ssrcVideo),
+                @"ssrc_fec" : @(p.ssrcFEC),
+                @"fec" : @NO,
+            }];
+            NSLog(@"[OmniCam] live retarget %dx%d@%d %d kbps", w, h, fps, kbps);
+        });
+    }];
 }
 
 #pragma mark Filter push

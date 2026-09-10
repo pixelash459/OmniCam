@@ -100,6 +100,10 @@ class MainWindow(QMainWindow):
         self._filter_push_timer.setSingleShot(True)
         self._filter_push_timer.setInterval(150)
         self._filter_push_timer.timeout.connect(self._flush_phone_filters)
+        self._session_push_timer = QTimer(self)
+        self._session_push_timer.setSingleShot(True)
+        self._session_push_timer.setInterval(250)
+        self._session_push_timer.timeout.connect(self._flush_session_controls)
         self._device_ips: Dict[int, str] = {}
 
         self._build_ui()
@@ -565,7 +569,12 @@ class MainWindow(QMainWindow):
             self._app.set_bitrate(BITRATES_KBPS[self._kbps_combo.currentIndex()])
 
     def _on_session_controls_changed(self, *_: Any) -> None:
-        """Push encode size/fps/bitrate immediately (not only on Start Stream)."""
+        """Debounce encode size/fps/bitrate so 1080↔720 cannot tear both apps down."""
+        if self._syncing_session:
+            return
+        self._session_push_timer.start()
+
+    def _flush_session_controls(self) -> None:
         if self._syncing_session:
             return
         idx = self._res_combo.currentIndex()

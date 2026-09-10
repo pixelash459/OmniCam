@@ -300,18 +300,14 @@ static void OCEncodeOutputCallback(void *outputCallbackRefCon,
 - (void)encodeLocked:(CVPixelBufferRef)buffer timestamp:(CMTime)pts {
     if (!_session || !_running) return;
 
-    // Resolution/fps changes (camera switch, 720p⇄1080p) arrive as differently-sized
-    // buffers; recreate the session so the pool and stream match (PROTOCOL started dims
-    // are advisory — actual buffer dims win).
+    // Live 720↔1080 and camera switch change the capture preset while VT is
+    // rebuilt to the *intended* size. Stray buffers of the old size used to
+    // recreate VT here, fighting retargetLiveEncode and hanging both apps.
+    // Drop mismatches; OCNetManager rebuilds the encoder on purpose.
     int w = (int)CVPixelBufferGetWidth(buffer);
     int h = (int)CVPixelBufferGetHeight(buffer);
     if (w != _sessionWidth || h != _sessionHeight) {
-        NSLog(@"[OmniCam] encoder input %dx%d != session %dx%d → recreating", w, h, _sessionWidth, _sessionHeight);
-        NSError *err = nil;
-        if (![self startLocked:w height:h fps:_fps kbps:_bitrateKbps keyint:_keyint error:&err]) {
-            NSLog(@"[OmniCam] encoder re-create failed: %@", err);
-            return;
-        }
+        return;
     }
 
     CFMutableDictionaryRef frameProps = NULL;
