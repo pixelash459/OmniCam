@@ -18,6 +18,11 @@ OmniCam.xcodeproj/
 *.xcuserdata
 DerivedData/
 
+# --- Release binaries (uploaded to GitHub Releases, not git) ---
+dist/*.exe
+dist/local.omnicam.app_*.ipa
+scripts/*.ips
+
 # --- OS junk ---
 .DS_Store
 Thumbs.db

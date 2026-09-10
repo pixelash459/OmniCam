@@ -35,6 +35,7 @@ Requires the repo to be on GitHub.
 1. Push the repo to GitHub (`main`, or any tag).
 2. Actions tab → **Build unsigned IPA** → *Run workflow* (or just push a tag — it triggers on `workflow_dispatch` and tag pushes).
 3. Wait for the green run (`macos-14` + **Xcode 15.4** — the last Xcode able to target iOS 12 — + `xcodegen` + `ldid`), then download the artifact **`OmniCam-unsigned.ipa`** from the run summary page.
+4. **Version tags** (`v1.1.3`, …) also attach **`OmniCam.ipa`** and **`OmniCam-PC-*-Setup.exe`** to the [Releases page](https://github.com/pixelash459/OmniCam/releases).
 
 The recipe is exactly: `xcodegen generate` → `xcodebuild ... CODE_SIGNING_ALLOWED=NO CODE_SIGN_IDENTITY="" ARCHS=arm64 IPHONEOS_DEPLOYMENT_TARGET=12.0` → assemble `Payload/OmniCam.app` → `ldid -S` main binary + any embedded frameworks → `zip -r OmniCam.ipa Payload`.
 

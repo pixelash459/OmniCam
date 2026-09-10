@@ -242,8 +242,8 @@ def test_beacon_discovery_builds_device_list():
             assert devices_seen, "on_devices callback must fire on discovery"
         finally:
             tx.close()
-        # a device that stops beaconing goes offline after 3.5 s
-        assert wait_until(lambda: listener.snapshot() == [], timeout=5.0,
+        # a device that stops beaconing goes offline after BEACON_OFFLINE_S
+        assert wait_until(lambda: listener.snapshot() == [], timeout=12.0,
                           interval=0.2)
     finally:
         listener.stop()

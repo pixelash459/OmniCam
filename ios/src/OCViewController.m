@@ -147,6 +147,10 @@ static UIColor *OCAccent(void) {
     _netManager.encoder = _encoder;
     _netManager.packer = _packer;
     _netManager.filterState = _filterState;
+    // Without these, Annex-B is produced but encoder:didProduceAnnexB: bails
+    // on a nil packer.network and never UDP-sends RTP (TCP control still works).
+    _packer.network = _netManager;
+    _packer.encoder = _encoder;
 
     _previewLayer.session = _captureEngine.session;
 }
@@ -592,8 +596,10 @@ static UIColor *OCAccent(void) {
     // WYSIWYG MTKView replaces the raw preview layer only while filters are active.
     BOOL identity = _filterState.isIdentity;
     BOOL metalOk = (_mtkView != nil);
-    _mtkView.hidden = identity || !metalOk;
-    _previewLayer.hidden = metalOk ? !identity : NO;
+    BOOL hideMtk = identity || !metalOk;
+    BOOL hideLayer = metalOk ? !identity : NO;
+    if (_mtkView.hidden != hideMtk) _mtkView.hidden = hideMtk;
+    if (_previewLayer.hidden != hideLayer) _previewLayer.hidden = hideLayer;
     if (!_mtkView.hidden) [_mtkView setNeedsDisplay];
 }
 
@@ -678,14 +684,12 @@ static UIColor *OCAccent(void) {
     sender.enabled = NO;
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         NSError *err = nil;
-        BOOL ok = [_netManager startStreamingToAddress:_netManager.clientAddress
-                                             videoPort:OCVideoPort
-                                                 width:1280
-                                                height:720
-                                                   fps:30
-                                                  kbps:3000
-                                                keyint:60
-                                                 error:&err];
+        BOOL ok = [_netManager startStreamingToConnectedClientWidth:1280
+                                                             height:720
+                                                                fps:30
+                                                               kbps:3000
+                                                             keyint:60
+                                                              error:&err];
         dispatch_async(dispatch_get_main_queue(), ^{
             _startButton.enabled = YES;
             if (!ok) {
@@ -933,33 +937,43 @@ didPickDocumentsAtURLs:(NSArray<NSURL *> *)urls {
     id<MTLCommandBuffer> cb = [_pipeline.commandQueue commandBuffer];
     if (!cb) return;
 
-    CGSize ds = view.drawableSize;
-    CIImage *img = [_pipeline lastPreviewImage];
-    if (img && !CGRectIsEmpty(img.extent)) {
-        // Letterbox-fit the landscape frame into the drawable.
-        CGRect ext = img.extent;
-        CGFloat s = MIN(ds.width / ext.size.width, ds.height / ext.size.height);
-        CGAffineTransform t = CGAffineTransformMakeTranslation((ds.width - ext.size.width * s) / 2.0,
-                                                               (ds.height - ext.size.height * s) / 2.0);
-        t = CGAffineTransformScale(t, s, s);
-        t = CGAffineTransformTranslate(t, -ext.origin.x, -ext.origin.y);
-        img = [img imageByApplyingTransform:t];
-        [_pipeline.ciContext render:img
-                       toMTLTexture:drawable.texture
-                      commandBuffer:cb
-                             bounds:CGRectMake(0, 0, ds.width, ds.height)
-                         colorSpace:_rgbSpace];
-    } else {
-        MTLRenderPassDescriptor *rpd = [MTLRenderPassDescriptor renderPassDescriptor];
-        rpd.colorAttachments[0].texture = drawable.texture;
-        rpd.colorAttachments[0].loadAction = MTLLoadActionClear;
-        rpd.colorAttachments[0].storeAction = MTLStoreActionStore;
-        rpd.colorAttachments[0].clearColor = MTLClearColorMake(0.0, 0.0, 0.0, 1.0);
-        id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:rpd];
-        [enc endEncoding];
+    @try {
+        CGSize ds = view.drawableSize;
+        CIImage *img = [_pipeline lastPreviewImage];
+        if (img && !CGRectIsEmpty(img.extent)) {
+            // Letterbox-fit the landscape frame into the drawable.
+            CGRect ext = img.extent;
+            CGFloat s = MIN(ds.width / ext.size.width, ds.height / ext.size.height);
+            CGAffineTransform t = CGAffineTransformMakeTranslation((ds.width - ext.size.width * s) / 2.0,
+                                                                   (ds.height - ext.size.height * s) / 2.0);
+            t = CGAffineTransformScale(t, s, s);
+            t = CGAffineTransformTranslate(t, -ext.origin.x, -ext.origin.y);
+            img = [img imageByApplyingTransform:t];
+            [_pipeline.ciContext render:img
+                           toMTLTexture:drawable.texture
+                          commandBuffer:cb
+                                 bounds:CGRectMake(0, 0, ds.width, ds.height)
+                             colorSpace:_rgbSpace];
+        } else {
+            MTLRenderPassDescriptor *rpd = [MTLRenderPassDescriptor renderPassDescriptor];
+            rpd.colorAttachments[0].texture = drawable.texture;
+            rpd.colorAttachments[0].loadAction = MTLLoadActionClear;
+            rpd.colorAttachments[0].storeAction = MTLStoreActionStore;
+            rpd.colorAttachments[0].clearColor = MTLClearColorMake(0.0, 0.0, 0.0, 1.0);
+            id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:rpd];
+            [enc endEncoding];
+        }
+        [cb presentDrawable:drawable];
+        [cb commit];
+    } @catch (NSException *ex) {
+        // Last Exception Backtrace in device IPS was on the main thread through
+        // UIKit + OmniCam; a CI KVC throw during preview must not abort the app.
+        static BOOL logged = NO;
+        if (!logged) {
+            logged = YES;
+            NSLog(@"[OmniCam] drawInMTKView exception: %@", ex);
+        }
     }
-    [cb presentDrawable:drawable];
-    [cb commit];
 }
 
 @end

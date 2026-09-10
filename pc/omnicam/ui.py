@@ -572,6 +572,11 @@ class MainWindow(QMainWindow):
     def _sync_phone_filters(self, state: Dict[str, Any]) -> None:
         """Update filter controls from a phone-side state (no push)."""
         self._syncing_filters = True
+        widgets = (self._pf_look, self._pf_beauty, self._pf_stylize, self._pf_amount,
+                   self._pf_mirror, self._pf_flipv, self._pf_rotate, self._pf_zoom,
+                   self._pf_panx, self._pf_pany)
+        for w in widgets:
+            w.blockSignals(True)
         try:
             look = str(state.get("look", "none"))
             idx = self._pf_look.findText(look)
@@ -593,6 +598,8 @@ class MainWindow(QMainWindow):
         except (TypeError, ValueError):
             log.exception("bad filter state from phone (ignored)")
         finally:
+            for w in widgets:
+                w.blockSignals(False)
             self._syncing_filters = False
 
     # ------------------------------------------------------------------
@@ -674,7 +681,9 @@ class MainWindow(QMainWindow):
                 code = str(payload.get("code", ""))
                 msg = str(payload.get("message", code))
                 self._set_status(f"error: {code} {msg}")
-                if code in ("busy", "nosuch", "badmsg"):
+                if code == "busy":
+                    self._set_status("phone busy — close OmniCam on the other PC (Beast) first")
+                elif code in ("nosuch", "badmsg"):
                     QMessageBox.warning(self, "Phone error",
                                         f"The phone reported an error: {code}\n{msg}")
 
@@ -716,18 +725,29 @@ class MainWindow(QMainWindow):
     def _refresh_devices(self) -> None:
         devices = self._app.get_devices()
         current = self._selected_device_ip()
-        self._device_list.clear()
-        if not devices:
-            self._device_list.addItem(QListWidgetItem("searching for phones..."))
-            return
+        labels = []
         for dev in devices:
             label = f"{dev['name']}  [{dev.get('model', '?')}]  {dev['ip']}"
             if dev.get("streaming"):
                 label += "  (streaming)"
+            labels.append((label, dev["ip"]))
+        # Rebuild only when the set of rows changed — clearing every 1 s made
+        # the list (and selection) strobe on flaky laptop Wi-Fi.
+        existing = []
+        for i in range(self._device_list.count()):
+            it = self._device_list.item(i)
+            existing.append((it.text(), it.data(Qt.ItemDataRole.UserRole)))
+        if existing == labels:
+            return
+        self._device_list.clear()
+        if not labels:
+            self._device_list.addItem(QListWidgetItem("searching for phones..."))
+            return
+        for label, ip in labels:
             item = QListWidgetItem(label)
-            item.setData(Qt.ItemDataRole.UserRole, dev["ip"])
+            item.setData(Qt.ItemDataRole.UserRole, ip)
             self._device_list.addItem(item)
-            if dev["ip"] == current:
+            if ip == current:
                 self._device_list.setCurrentItem(item)
 
     def _refresh_stats(self) -> None:

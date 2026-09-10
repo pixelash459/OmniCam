@@ -6,6 +6,9 @@ name: Build unsigned IPA
 # (scripts/build-wsl.sh) — fully offline from Apple, no Mac runner needed.
 # This workflow exists as the backup path because it is the last image family
 # that ships Xcode 15.x — the newest Xcode that can target iOS 12.
+#
+# Version tags (v*) also build the Windows installer and attach both
+# OmniCam.ipa and OmniCam-PC-*-Setup.exe to the GitHub Release.
 # ---------------------------------------------------------------------------
 
 on:
@@ -43,11 +46,6 @@ jobs:
             ARCHS=arm64 \
             IPHONEOS_DEPLOYMENT_TARGET=12.0 \
             -derivedDataPath build build | tail -n 40
-          # If the generated scheme ever misbehaves, fall back to -target:
-          # xcodebuild -project OmniCam.xcodeproj -target OmniCam -sdk iphoneos \
-          #   -configuration Release CODE_SIGNING_ALLOWED=NO \
-          #   CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" ARCHS=arm64 \
-          #   IPHONEOS_DEPLOYMENT_TARGET=12.0 -derivedDataPath build build
 
       - name: Assemble Payload and fake-sign with ldid
         run: |
@@ -81,3 +79,62 @@ jobs:
           name: OmniCam-unsigned.ipa
           path: OmniCam.ipa
           if-no-files-found: error
+
+      - name: Attach IPA to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: OmniCam.ipa
+          fail_on_unmatched_files: true
+
+  build-pc-installer:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Python deps
+        working-directory: pc
+        run: |
+          python -m pip install -U pip
+          python -m pip install -r requirements.txt pyinstaller pillow
+
+      - name: Build icon
+        working-directory: pc
+        run: python packaging/make_icon.py
+
+      - name: PyInstaller onedir
+        working-directory: pc
+        run: pyinstaller --noconfirm --clean OmniCam.spec
+
+      - name: Install Inno Setup
+        run: choco install innosetup --no-progress -y
+
+      - name: Compile installer
+        working-directory: pc
+        shell: pwsh
+        run: |
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) { $iscc = "$env:ProgramFiles\Inno Setup 6\ISCC.exe" }
+          if (-not (Test-Path $iscc)) { throw "ISCC.exe not found" }
+          & $iscc packaging\OmniCam.iss
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Upload installer artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: OmniCam-PC-Setup
+          path: dist/OmniCam-PC-*-Setup.exe
+          if-no-files-found: error
+
+      - name: Attach installer to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/OmniCam-PC-*-Setup.exe
+          fail_on_unmatched_files: true

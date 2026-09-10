@@ -31,6 +31,7 @@ static uint64_t ocNowMs(void) {
 @property (nonatomic, assign) CGColorSpaceRef colorSpace;
 // Diagnostics throttle: logs the first successful filtered render only.
 @property (nonatomic, assign) BOOL loggedFirstFilteredRender;
+@property (nonatomic, assign) BOOL loggedProcessException;
 @property (nonatomic, strong) dispatch_queue_t renderQueue;
 @property (nonatomic, strong) OCLutLoader *lutLoader;
 @property (nonatomic, assign) double lastRenderMs;
@@ -164,55 +165,77 @@ static uint64_t ocNowMs(void) {
     uint64_t t0 = ocNowMs();
     CIImage *inImage = [CIImage imageWithCVImageBuffer:input];
     CGRect wext = CGRectZero;
-    CIImage *result = [self processImage:inImage state:st outExtent:&wext];
+    CIImage *result = nil;
+    CVPixelBufferRef dest = NULL;
+    @try {
+        result = [self processImage:inImage state:st outExtent:&wext];
 
-    CVPixelBufferRef dest = [self acquireDestinationBufferForInput:input];
-    if (!dest) {
-        // Pool exhaustion: ship the unfiltered frame rather than dropping it.
+        dest = [self acquireDestinationBufferForInput:input];
+        if (!dest) {
+            // Pool exhaustion: ship the unfiltered frame rather than dropping it.
+            if (d) [d filterPipeline:self didOutputPixelBuffer:input timestamp:ts];
+            [self setPreviewImage:inImage];
+            dispatch_async(dispatch_get_main_queue(), ^{
+                [self notifyPreviewDelegate];
+            });
+            return;
+        }
+
+        // Render bounds must never exceed the destination buffer — the rotate-90
+        // geometry swap can make the working extent outgrow dest. Intersect; if the
+        // intersection is empty, fall back to the unfiltered pass-through rather
+        // than letting CI write out of bounds.
+        CGRect dstBounds = CGRectMake(0, 0,
+                                      (CGFloat)CVPixelBufferGetWidth(dest),
+                                      (CGFloat)CVPixelBufferGetHeight(dest));
+        CGRect renderBounds = CGRectIntersection(wext, dstBounds);
+        if (CGRectIsEmpty(renderBounds)) {
+            CFRelease(dest); // acquired CF_RETURNS_RETAINED - do not leak it
+            dest = NULL;
+            if (d) [d filterPipeline:self didOutputPixelBuffer:input timestamp:ts];
+            [self setPreviewImage:inImage];
+            dispatch_async(dispatch_get_main_queue(), ^{
+                [self notifyPreviewDelegate];
+            });
+            return;
+        }
+
+        [self clearNV12:dest];
+        // EAGLContext is not thread-safe; CI render without current context crashes/aborts on iOS 12.
+        if (_eaglContext) [EAGLContext setCurrentContext:_eaglContext];
+        [[self bufferRenderContext] render:result toCVPixelBuffer:dest bounds:renderBounds colorSpace:_colorSpace];
+        if (!_loggedFirstFilteredRender) {
+            // Throttled diagnostics: fires once, proving the GLES render path works
+            // and naming the destination buffer dimensions.
+            _loggedFirstFilteredRender = YES;
+            NSLog(@"[OCFilterPipeline] first filtered frame rendered OK: dest %zux%zu px, context %@",
+                  CVPixelBufferGetWidth(dest), CVPixelBufferGetHeight(dest),
+                  _eaglCIContext ? @"EAGL" : @"software fallback");
+        }
+        if (d) [d filterPipeline:self didOutputPixelBuffer:dest timestamp:ts];
+        CFRelease(dest);
+        dest = NULL;
+
+        _lastRenderMs = (double)(ocNowMs() - t0);
+        [self setPreviewImage:result];
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [self notifyPreviewDelegate];
+        });
+    } @catch (NSException *ex) {
+        if (dest) {
+            CFRelease(dest);
+            dest = NULL;
+        }
+        if (!_loggedProcessException) {
+            _loggedProcessException = YES;
+            NSLog(@"[OCFilterPipeline] processBuffer exception: %@", ex);
+        }
         if (d) [d filterPipeline:self didOutputPixelBuffer:input timestamp:ts];
         [self setPreviewImage:inImage];
         dispatch_async(dispatch_get_main_queue(), ^{
             [self notifyPreviewDelegate];
         });
-        return;
     }
-
-    // Render bounds must never exceed the destination buffer — the rotate-90
-    // geometry swap can make the working extent outgrow dest. Intersect; if the
-    // intersection is empty, fall back to the unfiltered pass-through rather
-    // than letting CI write out of bounds.
-    CGRect dstBounds = CGRectMake(0, 0,
-                                  (CGFloat)CVPixelBufferGetWidth(dest),
-                                  (CGFloat)CVPixelBufferGetHeight(dest));
-    CGRect renderBounds = CGRectIntersection(wext, dstBounds);
-    if (CGRectIsEmpty(renderBounds)) {
-        CFRelease(dest); // acquired CF_RETURNS_RETAINED - do not leak it
-        if (d) [d filterPipeline:self didOutputPixelBuffer:input timestamp:ts];
-        [self setPreviewImage:inImage];
-        dispatch_async(dispatch_get_main_queue(), ^{
-            [self notifyPreviewDelegate];
-        });
-        return;
-    }
-
-    [self clearNV12:dest];
-    [[self bufferRenderContext] render:result toCVPixelBuffer:dest bounds:renderBounds colorSpace:_colorSpace];
-    if (!_loggedFirstFilteredRender) {
-        // Throttled diagnostics: fires once, proving the GLES render path works
-        // and naming the destination buffer dimensions.
-        _loggedFirstFilteredRender = YES;
-        NSLog(@"[OCFilterPipeline] first filtered frame rendered OK: dest %zux%zu px, context %@",
-              CVPixelBufferGetWidth(dest), CVPixelBufferGetHeight(dest),
-              _eaglCIContext ? @"EAGL" : @"software fallback");
-    }
-    if (d) [d filterPipeline:self didOutputPixelBuffer:dest timestamp:ts];
-    CFRelease(dest);
-
-    _lastRenderMs = (double)(ocNowMs() - t0);
-    [self setPreviewImage:result];
-    dispatch_async(dispatch_get_main_queue(), ^{
-        [self notifyPreviewDelegate];
-    });
 }
 
 - (void)notifyPreviewDelegate {
@@ -299,9 +322,14 @@ static uint64_t ocNowMs(void) {
 - (CIImage *)applyFilter:(NSString *)name input:(CIImage *)in setup:(void (^)(CIFilter *))setup {
     CIFilter *f = [CIFilter filterWithName:name];
     if (!f) return in;
-    [f setValue:in forKey:kCIInputImageKey];
-    if (setup) setup(f);
-    return f.outputImage ?: in;
+    @try {
+        [f setValue:in forKey:kCIInputImageKey];
+        if (setup) setup(f);
+        return f.outputImage ?: in;
+    } @catch (NSException *ex) {
+        NSLog(@"[OCFilterPipeline] filter %@ exception: %@", name, ex);
+        return in;
+    }
 }
 
 - (CIImage *)crop:(CIImage *)img toRect:(CGRect)rect {
@@ -365,11 +393,11 @@ static uint64_t ocNowMs(void) {
         }];
     }
     if (st.temperature != 0.0) {
-        // CITemperatureAndTint: raising the assumed neutral temperature warms the output.
-        CGFloat neutral = 6500.0 + st.temperature * 3000.0;
+        // CITemperatureAndTint: inputNeutral / inputTargetNeutral (CIVector x=temp y=tint).
+        CGFloat targetNeutral = 6500.0 + st.temperature * 3000.0;
         img = [self applyFilter:@"CITemperatureAndTint" input:img setup:^(CIFilter *f) {
-            [f setValue:[CIVector vectorWithX:neutral Y:0] forKey:@"inputNeutral"];
-            [f setValue:[CIVector vectorWithX:0 Y:0] forKey:@"inputTint"];
+            [f setValue:[CIVector vectorWithX:6500 Y:0] forKey:@"inputNeutral"];
+            [f setValue:[CIVector vectorWithX:targetNeutral Y:0] forKey:@"inputTargetNeutral"];
         }];
     }
     if (st.vibrance != 0.0) {
@@ -419,8 +447,8 @@ static uint64_t ocNowMs(void) {
         img = [self applyFilter:@"CIColorInvert" input:img setup:NULL];
     } else if ([look isEqualToString:@"false_color"]) {
         img = [self applyFilter:@"CIFalseColor" input:img setup:^(CIFilter *f) {
-            [f setValue:[CIVector vectorWithX:0 Y:0 Z:0 W:1] forKey:@"inputColor0"];
-            [f setValue:[CIVector vectorWithX:0.7 Y:1.0 Z:0.3 W:1] forKey:@"inputColor1"];
+            [f setValue:[CIColor colorWithRed:0 green:0 blue:0 alpha:1] forKey:@"inputColor0"];
+            [f setValue:[CIColor colorWithRed:0.7 green:1.0 blue:0.3 alpha:1] forKey:@"inputColor1"];
         }];
     }
 
@@ -466,7 +494,6 @@ static uint64_t ocNowMs(void) {
         img = [self applyFilter:@"CIBumpDistortion" input:img setup:^(CIFilter *f) {
             [f setValue:[CIVector vectorWithX:wcenter.x Y:(wcenter.y + wext.size.height * 0.15)] forKey:@"inputCenter"];
             [f setValue:@(wmax * 0.6) forKey:@"inputRadius"];
-            [f setValue:@(amt * (CGFloat)M_PI) forKey:@"inputAngle"];
             [f setValue:@(0.2 + amt * 0.8) forKey:@"inputScale"];
         }];
     } else if ([sz isEqualToString:@"soft_blur"]) {
@@ -639,6 +666,8 @@ static uint64_t ocNowMs(void) {
             if (CGRectIsEmpty(bounds)) return;
         }
         [self clearNV12:output];
+        // EAGLContext is not thread-safe; CI render without current context crashes/aborts on iOS 12.
+        if (self->_eaglContext) [EAGLContext setCurrentContext:self->_eaglContext];
         // EAGL-backed context (BUG 1 fix); Metal never renders into NV12 buffers.
         [[self bufferRenderContext] render:toRender toCVPixelBuffer:output bounds:bounds colorSpace:self->_colorSpace];
     });

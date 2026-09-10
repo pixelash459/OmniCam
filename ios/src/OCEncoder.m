@@ -192,7 +192,7 @@ static void OCEncodeOutputCallback(void *outputCallbackRefCon,
     _fps = fps > 0 ? fps : 30;
     _keyint = keyint > 0 ? keyint : 60;
     _bitrateKbps = kbps;
-    _forceKeyNext = NO;
+    _forceKeyNext = YES;
     _cachedSPS = nil;
     _cachedPPS = nil;
     _running = YES;

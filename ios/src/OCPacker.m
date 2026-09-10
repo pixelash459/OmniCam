@@ -145,7 +145,15 @@ static inline void ocSetMarker(NSMutableData *pkt) {
            ptsMs:(double)ptsMs
            dtsMs:(double)dtsMs {
     OCNetManager *net = _network;
-    if (!net || annexB.length == 0) return;
+    if (!net) {
+        static BOOL sLoggedNilNet = NO;
+        if (!sLoggedNilNet) {
+            sLoggedNilNet = YES;
+            NSLog(@"packer has no network — RTP dropped");
+        }
+        return;
+    }
+    if (annexB.length == 0) return;
 
     uint32_t ts = (uint32_t)(uint64_t)llround(ptsMs * (OCRTPClockVideo / 1000.0));
     const uint8_t *bytes = annexB.bytes;

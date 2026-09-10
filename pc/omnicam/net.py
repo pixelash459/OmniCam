@@ -51,7 +51,7 @@ RTCP_PT_PLI = 206        # PLI, FMT=1
 RTP_CLOCK_VIDEO = 90000  # Hz
 
 BEACON_MAGIC = "OMNICAM1"
-BEACON_OFFLINE_S = 3.5   # device offline after 3.5 s without beacon
+BEACON_OFFLINE_S = 10.0  # offline after 10 s without a beacon (laptop Wi-Fi drops broadcasts)
 
 MAX_VIDEO_PAYLOAD = 1200  # informational (sender side)
 
@@ -414,6 +414,7 @@ class ControlClient:
     """
 
     RECONNECT_INTERVAL_S = 3.0
+    BUSY_BACKOFF_S = 15.0
     MAX_MESSAGE = 64 * 1024
 
     def __init__(
@@ -437,6 +438,7 @@ class ControlClient:
         self._rtt_smooth: Optional[float] = None
         self._pending_pings: Dict[int, float] = {}  # ts payload -> monotonic
         self._ping_lock = threading.Lock()
+        self._got_busy = False
 
     # -- lifecycle ---------------------------------------------------------
     def connect_to(self, ip: str, port: int = CONTROL_PORT) -> None:
@@ -486,7 +488,8 @@ class ControlClient:
     # -- PC -> phone messages (PROTOCOL.md section 2.1) --------------------
     def send_hello(self) -> bool:
         """``hello`` with the PC hostname; must be sent right after connect."""
-        return self._send({"t": "hello", "name": socket.gethostname(), "ver": 1})
+        return self._send({"t": "hello", "name": socket.gethostname(), "ver": 1},
+                          require_connected=False)
 
     def send_start(self, rtp_host: str, video: Dict[str, Any]) -> bool:
         """``start``: rtp_host + video{port,w,h,fps,kbps,keyint}."""
@@ -546,10 +549,10 @@ class ControlClient:
         return self._send({"t": "bye"})
 
     # -- internals ---------------------------------------------------------
-    def _send(self, obj: Dict[str, Any]) -> bool:
+    def _send(self, obj: Dict[str, Any], *, require_connected: bool = True) -> bool:
         """Serialize + send one JSON line; returns False when not connected."""
         sock = self._sock
-        if sock is None or not self._connected:
+        if sock is None or (require_connected and not self._connected):
             return False
         try:
             data = (json.dumps(obj, separators=(",", ":")) + "\n").encode("utf-8")
@@ -564,7 +567,12 @@ class ControlClient:
             return False
 
     def _run(self) -> None:
-        """Connect/recv loop with auto-reconnect every 3 s."""
+        """Connect/recv loop. Connected is latched only after ``welcome``.
+
+        A second PC (or this laptop while Beast still holds the slot) used to
+        flip the UI connected→disconnected on every attempt: TCP succeeded,
+        we advertised connected, the phone replied ``busy`` and closed.
+        """
         while not self._stop_evt.is_set():
             target = self._target
             if target is None:
@@ -574,6 +582,7 @@ class ControlClient:
             try:
                 sock = socket.create_connection((ip, port), timeout=3.0)
                 sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
                 sock.settimeout(None)
             except OSError as exc:
                 log.debug("control connect to %s:%d failed: %s", ip, port, exc)
@@ -583,14 +592,18 @@ class ControlClient:
                 continue
             with self._sock_lock:
                 self._sock = sock
-            self._set_connected(True, f"connected to {ip}")
+            self._got_busy = False
             self.send_hello()
             try:
                 self._recv_loop(sock)
             finally:
                 self._close_socket(sock)
-                self._set_connected(False, "disconnected")
-                if self._stop_evt.wait(self.RECONNECT_INTERVAL_S):
+                wait = self.BUSY_BACKOFF_S if self._got_busy else self.RECONNECT_INTERVAL_S
+                if self._got_busy:
+                    self._set_connected(False, "phone busy — another PC is connected")
+                elif self._connected:
+                    self._set_connected(False, "disconnected")
+                if self._stop_evt.wait(wait):
                     break
         log.debug("control client exited")
 
@@ -626,6 +639,12 @@ class ControlClient:
             return
         if msg["t"] == "pong":
             self._handle_pong(msg)
+        if msg["t"] == "welcome" and self._target:
+            self._set_connected(True, f"connected to {self._target[0]}")
+        if msg["t"] == "error" and str(msg.get("code", "")) == "busy":
+            self._got_busy = True
+            log.info("phone busy (another control client holds the slot)")
+            self._close_socket()
         if self._on_message is not None:
             try:
                 self._on_message(msg)
@@ -771,7 +790,10 @@ class VideoReceiver:
             return
         self._stop_evt.clear()
         self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        # Exclusive bind: SO_REUSEADDR on Windows lets a second OmniCam (or Beast
+        # leftover) steal unicast RTP and looks like the stream is strobing.
+        if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+            self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
         try:
             self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4 << 20)
         except OSError:

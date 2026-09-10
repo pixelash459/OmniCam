@@ -8,13 +8,16 @@ low-latency in-process (PyAV/FFmpeg), shows a preview, and mirrors it into
 Video-only — audio is intentionally not implemented (v1.1); use your own
 microphone in the consumer app.
 
-## Ready-made .exe (no Python needed)
+## Ready-made installer (no Python needed)
 
-A compiled, tested **OmniCam-PC-1.1.0-windows.exe** is on the Releases page:
-<https://github.com/pixelash459/OmniCam/releases/tag/v1.1.0> — download,
-double-click, done (still install OBS Studio for webcam output; allow the
-firewall prompt; SmartScreen may need *More info → Run anyway* since the exe
-is unsigned). To rebuild it yourself after code changes, run `build-exe.bat`.
+Download **`OmniCam-PC-*-Setup.exe`** from the [GitHub Releases page](https://github.com/pixelash459/OmniCam/releases) (or build it locally with `pc\build-exe.bat`):
+
+1. Keep **Allow OmniCam through Windows Firewall** checked (UDP 9920–9921 so the phone can be discovered).
+2. Finish → desktop / Start menu shortcut **OmniCam PC**.
+3. Optional but required for Zoom/Teams webcam: install [OBS Studio](https://obsproject.com) once and click **Start Virtual Camera** in OBS.
+4. SmartScreen may show *More info → Run anyway* (the installer is unsigned).
+
+This is an **onedir** install under `Program Files\OmniCam` — it does **not** unpack to `%TEMP%` on every launch (that old single-file `.exe` is what made laptops feel broken). Rebuild after code changes with `pc\build-exe.bat`.
 
 ## 0. Fresh laptop setup (from a clone of this repo)
 

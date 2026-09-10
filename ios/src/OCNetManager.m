@@ -15,6 +15,7 @@
 #import <ifaddrs.h>
 #import <unistd.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <string.h>
 #include <stdlib.h>
 
@@ -23,7 +24,7 @@ const int OCVideoPort   = 9921;
 const int OCControlPort = 9923;
 
 NSString * const OCMagicString      = @"OMNICAM1";
-NSString * const OCAppVersionString = @"1.1.0";
+NSString * const OCAppVersionString = @"1.1.3";
 
 static const NSUInteger OCMaxLineBytes = 64 * 1024; // §2 max message 64 KiB
 static const double OCAbrFloorKbps = 500.0;         // §6
@@ -59,6 +60,7 @@ static NSString *ocDeviceModel(void) {
     int _maxBitrateKbps;     // ABR ceiling = configured start bitrate (§6)
     int _currentBitrateKbps;
     int _fps;
+    int _streamWidth, _streamHeight; // last start dims — skip stop/start flicker
     double _lastLossPct, _lastJitterMs;
     int _highLossCount;      // consecutive rr with loss > 10 % (sustained-loss IDR)
     int _fecHighCount, _fecLowCount;
@@ -126,6 +128,19 @@ static NSString *ocDeviceModel(void) {
 - (NSString *)clientAddress { return _clientAddress; }
 - (BOOL)abrAuto { return _abrAuto; }
 - (int)currentBitrateKbps { return _currentBitrateKbps; }
+
+- (void)setPacker:(OCPacker *)packer {
+    _packer = packer;
+    if (packer) {
+        packer.network = self;
+        if (_encoder) packer.encoder = _encoder;
+    }
+}
+
+- (void)setEncoder:(OCEncoder *)encoder {
+    _encoder = encoder;
+    if (_packer) _packer.encoder = encoder;
+}
 
 #pragma mark Start / stop
 
@@ -312,7 +327,7 @@ static NSString *ocDeviceModel(void) {
         addr.sin_family = AF_INET;
         addr.sin_port = htons(OCControlPort);
         addr.sin_addr.s_addr = htonl(INADDR_ANY);
-        if (bind(s, (struct sockaddr *)&addr, sizeof addr) != 0 || listen(s, 1) != 0) {
+        if (bind(s, (struct sockaddr *)&addr, sizeof addr) != 0 || listen(s, 8) != 0) {
             [self failOnMain:[NSString stringWithFormat:@"TCP listen :%d failed (%s)", OCControlPort, strerror(errno)]];
             close(s);
             return;
@@ -347,11 +362,18 @@ static NSString *ocDeviceModel(void) {
     }
     int nodelay = 1;
     setsockopt(c, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof nodelay);
+    int keepalive = 1;
+    setsockopt(c, SOL_SOCKET, SO_KEEPALIVE, &keepalive, sizeof keepalive);
+    // GCD DISPATCH_SOURCE_TYPE_READ + blocking recv can spin-close the
+    // socket (EAGAIN/0-byte wakes). Non-blocking: drain and return.
+    int flags = fcntl(c, F_GETFL, 0);
+    if (flags >= 0) fcntl(c, F_SETFL, flags | O_NONBLOCK);
 
     struct sockaddr_in peer;
     socklen_t plen = sizeof peer;
     char ip[INET_ADDRSTRLEN] = {0};
     if (getpeername(c, (struct sockaddr *)&peer, &plen) == 0 &&
+        peer.sin_family == AF_INET &&
         inet_ntop(AF_INET, &peer.sin_addr, ip, sizeof ip)) {
         _clientAddress = [NSString stringWithUTF8String:ip];
     } else {
@@ -369,7 +391,7 @@ static NSString *ocDeviceModel(void) {
         [sself readClientSocket];
     });
     dispatch_source_set_cancel_handler(src, ^{
-        close(c);
+        // Socket is closed in closeClientSocket to avoid a half-open race.
     });
     _clientSource = src;
     dispatch_resume(src);
@@ -386,7 +408,7 @@ static NSString *ocDeviceModel(void) {
             return;
         }
         if (n < 0) {
-            if (errno == EINTR || errno == EAGAIN) return;
+            if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) return;
             [self closeClientSocket];
             return;
         }
@@ -418,12 +440,18 @@ static NSString *ocDeviceModel(void) {
 
 // Runs on _clientQueue.
 - (void)closeClientSocket {
+    // Close the fd immediately so a reconnecting PC cannot race into
+    // accept() while the old socket is still half-open (that looks like
+    // connect/disconnect strobing on the phone HUD).
+    int fd = _clientSock;
+    _clientSock = -1;
     if (_clientSource) {
         dispatch_source_cancel(_clientSource);
         _clientSource = nil;
     }
-    if (_clientSock != -1) {
-        _clientSock = -1;
+    if (fd != -1) {
+        shutdown(fd, SHUT_RDWR);
+        close(fd);
         _lineBuf = nil;
         NSString *ip = _clientAddress;
         _clientAddress = nil;
@@ -449,7 +477,10 @@ static NSString *ocDeviceModel(void) {
         while (left > 0) {
             ssize_t n = send(self->_clientSock, p, left, 0);
             if (n <= 0) {
-                if (errno == EINTR) continue;
+                if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) {
+                    if (errno == EAGAIN || errno == EWOULDBLOCK) usleep(1000);
+                    continue;
+                }
                 [self closeClientSocket];
                 return;
             }
@@ -488,7 +519,10 @@ static NSString *ocDeviceModel(void) {
     while (left > 0) {
         ssize_t n = send(_clientSock, p, left, 0);
         if (n <= 0) {
-            if (errno == EINTR) continue;
+            if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) {
+                if (errno == EAGAIN || errno == EWOULDBLOCK) usleep(1000);
+                continue;
+            }
             [self closeClientSocket];
             return;
         }
@@ -800,6 +834,27 @@ static NSString *ocDeviceModel(void) {
     return ok;
 }
 
+- (BOOL)startStreamingToConnectedClientWidth:(int)w
+                                      height:(int)h
+                                         fps:(int)fps
+                                        kbps:(int)kbps
+                                      keyint:(int)keyint
+                                       error:(NSError **)error {
+    __block NSString *peerIP = nil;
+    dispatch_sync(_clientQueue, ^{
+        peerIP = [self currentClientPeerIPv4] ?: self->_clientAddress;
+    });
+    if (peerIP.length == 0) {
+        if (error) *error = [NSError errorWithDomain:@"OCNetManager" code:1
+                                userInfo:@{NSLocalizedDescriptionKey : @"No TCP client for RTP dest"}];
+        return NO;
+    }
+    NSLog(@"[OmniCam] UI start: media dest = %@ (TCP peer)", peerIP);
+    return [self startStreamingToAddress:peerIP videoPort:OCVideoPort
+                                   width:w height:h fps:fps kbps:kbps
+                                  keyint:keyint error:error];
+}
+
 - (BOOL)startStreamingLockedToAddress:(NSString *)ip
                             videoPort:(int)videoPort
                                width:(int)w
@@ -822,6 +877,23 @@ static NSString *ocDeviceModel(void) {
         if (error) *error = [NSError errorWithDomain:@"OCNetManager" code:2
                                   userInfo:@{NSLocalizedDescriptionKey : [NSString stringWithFormat:@"Bad IP: %@", ip]}];
         return NO;
+    }
+
+    // Same PC hitting Start again (or a duplicate `start` after welcome) used
+    // to stop+restart the encoder every time — HUD START/STOP strobe and a
+    // 1–2 frame black flash. Keep the live session if dest+dims match.
+    if (_streaming && _destValid && _videoPort == videoPort
+        && _rtpDest.sin_addr.s_addr == dest.sin_addr.s_addr
+        && _streamWidth == w && _streamHeight == h && _fps == fps) {
+        NSLog(@"[OmniCam] start ignored (already streaming → %@ :%d)", ip, videoPort);
+        OCPacker *pk = _packer;
+        [self sendJson:@{
+            @"t" : @"started",
+            @"ssrc_video" : @(pk ? pk.ssrcVideo : 0),
+            @"ssrc_fec" : @(pk ? pk.ssrcFEC : 0),
+            @"fec" : @(pk ? pk.isFecEnabled : NO),
+        }];
+        return YES;
     }
 
     OCCaptureEngine *ce = _captureEngine;
@@ -861,6 +933,8 @@ static NSString *ocDeviceModel(void) {
 
     _streaming = YES;
     _fps = fps;
+    _streamWidth = w;
+    _streamHeight = h;
     _maxBitrateKbps = kbps; // ABR cap = configured bitrate (§6)
     _currentBitrateKbps = kbps;
     _highLossCount = 0;
@@ -897,6 +971,7 @@ static NSString *ocDeviceModel(void) {
     if (!_streaming) return;
     _streaming = NO;
     _destValid = NO;
+    _streamWidth = _streamHeight = 0;
     OCEncoder *e = _encoder;
     if (e) [e stop];
     OCPacker *pk = _packer;

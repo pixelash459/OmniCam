@@ -17,7 +17,7 @@ extern const int OCVideoPort;    // 9921
 extern const int OCControlPort;  // 9923
 
 extern NSString * const OCMagicString;       // "OMNICAM1"
-extern NSString * const OCAppVersionString;  // "1.1.0"
+extern NSString * const OCAppVersionString;  // "1.1.3"
 
 @class OCNetManager, OCCaptureEngine, OCEncoder, OCPacker;
 
@@ -65,6 +65,13 @@ extern NSString * const OCAppVersionString;  // "1.1.0"
                            kbps:(int)kbps
                          keyint:(int)keyint
                           error:(NSError **)error;
+/// Phone Start button: same TCP-peer dest as the PC `start` message.
+- (BOOL)startStreamingToConnectedClientWidth:(int)w
+                                      height:(int)h
+                                         fps:(int)fps
+                                        kbps:(int)kbps
+                                      keyint:(int)keyint
+                                       error:(NSError **)error;
 - (void)stopStreaming;
 
 /// ABR ceiling updates (resolution change on the phone UI).
