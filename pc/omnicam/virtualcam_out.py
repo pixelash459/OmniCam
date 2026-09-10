@@ -4,7 +4,8 @@ Tries the ``obs`` backend (OBS Virtual Camera, installed with OBS Studio)
 first and falls back to ``unitycapture``.  Frames are consumed with
 latest-wins semantics: the sender thread always picks up the most recent
 BGR frame and never queues stale ones.  If the frame geometry changes
-(e.g. local rotation), the camera is transparently reopened.
+(live 720<->1080, local rotation) the frame is scaled into the size the
+device was opened with; the device itself is never reopened mid-session.
 """
 
 from __future__ import annotations
@@ -30,6 +31,33 @@ BACKENDS = ("obs", "unitycapture")
 
 class VirtualCamError(RuntimeError):
     """Raised when no virtual camera backend can be opened."""
+
+
+def _fit_frame(frame: np.ndarray, width: int, height: int) -> np.ndarray:
+    """Return ``frame`` (BGR HxWx3) scaled to fit ``width``x``height``,
+    aspect preserved, centred on black. Uses PyAV's swscale (already a
+    dependency) and falls back to nearest-neighbour numpy indexing."""
+    h, w = frame.shape[:2]
+    if (w, h) == (width, height):
+        return frame
+    scale = min(width / float(w), height / float(h))
+    nw = max(2, int(round(w * scale)) // 2 * 2)
+    nh = max(2, int(round(h * scale)) // 2 * 2)
+    try:
+        import av  # PyAV, in-process swscale
+        vf = av.VideoFrame.from_ndarray(np.ascontiguousarray(frame), format="bgr24")
+        scaled = vf.reformat(width=nw, height=nh, format="bgr24").to_ndarray()
+    except Exception:
+        ys = (np.arange(nh) * (h / float(nh))).astype(np.intp)
+        xs = (np.arange(nw) * (w / float(nw))).astype(np.intp)
+        scaled = frame[ys][:, xs]
+    if (nw, nh) == (width, height):
+        return scaled
+    out = np.zeros((height, width, 3), dtype=frame.dtype)
+    y0 = (height - nh) // 2
+    x0 = (width - nw) // 2
+    out[y0:y0 + nh, x0:x0 + nw] = scaled
+    return out
 
 
 class VirtualCamOut:
@@ -161,20 +189,11 @@ class VirtualCamOut:
                 break
             h, w = frame.shape[:2]
             if (w, h) != (cam.width, cam.height):
-                # geometry changed (rotation) -> reopen transparently
-                try:
-                    cam.close()
-                    import pyvirtualcam
-                    cam = pyvirtualcam.Camera(width=w, height=h, fps=int(self._fps),
-                                              backend=self._backend)
-                    self._cam = cam
-                    self._dims = (w, h, int(self._fps))
-                    log.info("virtual camera reopened at %dx%d", w, h)
-                except Exception as exc:
-                    log.error("virtual camera reopen failed: %s", exc)
-                    self._status(f"virtual camera error: {exc}")
-                    self.stop()
-                    return
+                # Stream geometry changed (live 720<->1080, rotation). The device
+                # keeps the size it was opened with - consumers (Zoom/OBS/Teams)
+                # negotiated that format and a reopen mid-call breaks them - so
+                # letterbox/scale the frame into the opened size instead.
+                frame = _fit_frame(frame, cam.width, cam.height)
             try:
                 self._cam.send(np.ascontiguousarray(frame))
                 self._cam.sleep_until_next_frame()

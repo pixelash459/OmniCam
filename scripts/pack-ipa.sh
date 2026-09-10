@@ -5,7 +5,7 @@ export PATH="$THEOS/bin:$THEOS/toolchain/linux/iphone/bin:$PATH"
 APP="$HOME/omni-ios/.theos/obj/OmniCam.app"
 DEST="/mnt/e/Vibe ios apps/OmniCam/dist"
 OUT="$DEST/OmniCam.ipa"
-VER_OUT="$DEST/local.omnicam.app_1.1.10.ipa"
+VER_OUT="$DEST/local.omnicam.app_1.1.11.ipa"
 echo "packing $APP -> $OUT"
 python3 - <<'PY'
 import plistlib

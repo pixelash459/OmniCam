@@ -553,9 +553,13 @@ class OmniCamApp:
         """Configure receivers/decoders from the ``started`` message."""
         ip = self.control.target_ip
         ssrc_video = int(msg.get("ssrc_video", 0))
+        ssrc_fec = int(msg.get("ssrc_fec", 0))
         self._fec_active = bool(msg.get("fec", False))
         fps = self._stream_cfg["fps"]
-        self.video_rx.set_session(ssrc_video, ip or "255.255.255.255", fps)
+        # New SSRC => new encoder on the phone (start or live 720<->1080). Gate the
+        # receiver on it, drop queued Annex-B, and start a clean H.264 decoder.
+        self.video_rx.set_session(ssrc_video, ip or "255.255.255.255", fps,
+                                  fec_ssrc=ssrc_fec or None)
         self._streaming = True
         self._drain_video_queue()
         with self._vdec_lock:

@@ -6,11 +6,35 @@
 #import "OCFilterState.h"
 #import "OCLutLoader.h"
 
+#include <stdio.h>
+#include <unistd.h>
+
 NSNotificationName const OCImportedLutsDidChangeNotification = @"OCImportedLutsDidChangeNotification";
+
+// Mirror NSLog (stderr) into Documents/omnicam.log so a glitch can be diagnosed
+// over SSH after the fact (there is no `log`/`oslog` tool on the jailbroken
+// phone). Rotates once the file passes 2 MiB. Skipped when a debugger has a tty.
+static void OCRedirectLogToFile(void) {
+    if (isatty(STDERR_FILENO)) return;
+    NSString *dir = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
+    if (!dir) return;
+    NSString *path = [dir stringByAppendingPathComponent:@"omnicam.log"];
+    NSString *prev = [dir stringByAppendingPathComponent:@"omnicam.prev.log"];
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSDictionary *attrs = [fm attributesOfItemAtPath:path error:nil];
+    if (attrs && [attrs fileSize] > 2u * 1024u * 1024u) {
+        [fm removeItemAtPath:prev error:nil];
+        [fm moveItemAtPath:path toPath:prev error:nil];
+    }
+    if (!freopen(path.fileSystemRepresentation, "a+", stderr)) return;
+    setvbuf(stderr, NULL, _IOLBF, 0);
+    NSLog(@"[OmniCam] ---- launch, logging to %@ ----", path);
+}
 
 @implementation OCAppDelegate
 
 - (BOOL)application:(UIApplication *)application didFinishLaunchingWithOptions:(NSDictionary *)launchOptions {
+    OCRedirectLogToFile();
     self.window = [[UIWindow alloc] initWithFrame:[UIScreen mainScreen].bounds];
     self.window.backgroundColor = [UIColor blackColor];
     OCViewController *vc = [[OCViewController alloc] initWithFilterState:[OCFilterState restoredState]];

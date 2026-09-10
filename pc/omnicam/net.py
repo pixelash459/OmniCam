@@ -826,7 +826,9 @@ class VideoReceiver:
         self._fps = fps
         self._sender_ssrc = random.getrandbits(32)
         self._media_ssrc: Optional[int] = None
+        self._fec_ssrc: Optional[int] = None
         self._feedback_addr: Optional[Tuple[str, int]] = None
+        self._foreign_packets = 0  # packets dropped because their SSRC is not the announced one
 
         self._sock: Optional[socket.socket] = None
         self._rxq: "deque[Tuple[RtpPacket, float]]" = deque()
@@ -905,10 +907,18 @@ class VideoReceiver:
         self._recv_thread = self._proc_thread = None
 
     # -- configuration -----------------------------------------------------
-    def set_session(self, media_ssrc: int, phone_ip: str, fps: float) -> None:
+    def set_session(self, media_ssrc: int, phone_ip: str, fps: float,
+                    fec_ssrc: Optional[int] = None) -> None:
         """Apply ``started`` info: media SSRC for feedback, feedback target and
-        the negotiated fps; resets all sequence/frame state."""
+        the negotiated fps; resets all sequence/frame state.
+
+        Every ``started`` (initial or a live 720<->1080 retarget) carries a fresh
+        SSRC. Only packets carrying that SSRC are processed afterwards, so
+        in-flight packets from the previous encoder cannot re-latch the reorder
+        buffer onto a dead sequence space (which froze video after a switch).
+        """
         self._media_ssrc = media_ssrc & 0xFFFFFFFF
+        self._fec_ssrc = (fec_ssrc & 0xFFFFFFFF) if fec_ssrc else None
         self._feedback_addr = (phone_ip, VIDEO_PORT)
         self._fps = max(1.0, float(fps))
         self.reset()
@@ -933,6 +943,7 @@ class VideoReceiver:
         """Stop NACK/PLI toward the phone (call on Stop Stream; keep UDP bound)."""
         self._feedback_addr = None
         self._media_ssrc = None
+        self._fec_ssrc = None
         self.reset()
 
     def set_frame_callback(self, cb: Callable[[bytes, Dict[str, Any]], None]) -> None:
@@ -1030,10 +1041,7 @@ class VideoReceiver:
             if item is not None:
                 pkt, recv_mono = item
                 try:
-                    if pkt.pt == PT_VIDEO:
-                        self._handle_media(pkt, recv_mono, now)
-                    else:
-                        self._handle_fec(pkt, now)
+                    self._dispatch(pkt, recv_mono, now)
                 except Exception:
                     log.exception("video packet processing error (ignored)")
             try:
@@ -1041,6 +1049,28 @@ class VideoReceiver:
             except Exception:
                 log.exception("video maintenance error (ignored)")
         log.debug("video process loop exited")
+
+    def _dispatch(self, pkt: RtpPacket, recv_mono: float, now: float) -> None:
+        """SSRC-gate one packet, then route it to media or FEC handling."""
+        if pkt.pt == PT_VIDEO:
+            if self._media_ssrc is not None and pkt.ssrc != self._media_ssrc:
+                self._note_foreign(pkt)
+                return
+            self._handle_media(pkt, recv_mono, now)
+        else:
+            if self._fec_ssrc is not None and pkt.ssrc != self._fec_ssrc:
+                self._note_foreign(pkt)
+                return
+            self._handle_fec(pkt, now)
+
+    def _note_foreign(self, pkt: RtpPacket) -> None:
+        """Count (and occasionally log) a packet from an SSRC we are not on."""
+        self._foreign_packets += 1
+        if self._foreign_packets in (1, 100, 1000) or self._foreign_packets % 10000 == 0:
+            log.info("ignoring RTP from foreign SSRC %08x (pt %d, want %s); %d so far",
+                     pkt.ssrc, pkt.pt,
+                     f"{self._media_ssrc:08x}" if self._media_ssrc is not None else "any",
+                     self._foreign_packets)
 
     # seq arithmetic helper
     @staticmethod

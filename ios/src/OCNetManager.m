@@ -24,7 +24,7 @@ const int OCVideoPort   = 9921;
 const int OCControlPort = 9923;
 
 NSString * const OCMagicString      = @"OMNICAM1";
-NSString * const OCAppVersionString = @"1.1.10";
+NSString * const OCAppVersionString = @"1.1.11";
 
 static const NSUInteger OCMaxLineBytes = 64 * 1024; // §2 max message 64 KiB
 static const double OCAbrFloorKbps = 500.0;         // §6
@@ -910,6 +910,8 @@ static BOOL ocTcpSendAll(int fd, const uint8_t *p, size_t left) {
     BOOL encodeChanged = (_sessionW != oldW || _sessionH != oldH || _sessionFps != oldFps);
     BOOL kbpsChanged = (_sessionKbps != oldKbps);
     if (_streaming && encodeChanged) {
+        NSLog(@"[OmniCam] session retarget %dx%d@%d -> %dx%d@%d (%d kbps)",
+              oldW, oldH, oldFps, _sessionW, _sessionH, _sessionFps, _sessionKbps);
         if (!dispatch_get_specific(kOCMediaQueueKey)) {
             dispatch_async(_mediaQueue, ^{ [self retargetLiveEncode]; });
         } else {
