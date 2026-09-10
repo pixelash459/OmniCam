@@ -515,6 +515,7 @@ class MainWindow(QMainWindow):
         self._app.start_stream(w, h, fps, kbps)
 
     def _on_stop_stream(self) -> None:
+        self._btn_stop.setEnabled(False)
         self._app.stop_stream()
 
     def _on_camera(self, camera_id: str) -> None:

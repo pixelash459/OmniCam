@@ -881,6 +881,12 @@ class VideoReceiver:
         with self._stat_lock:
             self._loss_win.clear()
 
+    def pause_feedback(self) -> None:
+        """Stop NACK/PLI toward the phone (call on Stop Stream; keep UDP bound)."""
+        self._feedback_addr = None
+        self._media_ssrc = None
+        self.reset()
+
     def set_frame_callback(self, cb: Callable[[bytes, Dict[str, Any]], None]) -> None:
         """Register ``cb(annexb_bytes, meta)`` called per complete frame."""
         self._on_frame = cb

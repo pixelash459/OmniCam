@@ -1,6 +1,6 @@
 ; OmniCam PC Windows installer (Inno Setup 6)
 #define MyAppName "OmniCam PC"
-#define MyAppVersion "1.1.4"
+#define MyAppVersion "1.1.5"
 #define MyAppPublisher "OmniCam"
 #define MyAppURL "https://github.com/pixelash459/OmniCam"
 #define MyAppExeName "OmniCam.exe"

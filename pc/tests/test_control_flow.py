@@ -259,3 +259,13 @@ def test_manual_pin_stays_in_device_list_without_beacons():
     assert snap[0]["manual"] is True
     listener.pin("192.168.1.42")  # idempotent
     assert len(listener.snapshot()) == 1
+
+
+def test_pause_feedback_clears_rtcp_target():
+    from omnicam.net import VideoReceiver
+    rx = VideoReceiver()
+    rx._feedback_addr = ("192.168.1.9", 9921)
+    rx._media_ssrc = 1
+    rx.pause_feedback()
+    assert rx._feedback_addr is None
+    assert rx._media_ssrc is None

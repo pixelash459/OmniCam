@@ -24,10 +24,11 @@ const int OCVideoPort   = 9921;
 const int OCControlPort = 9923;
 
 NSString * const OCMagicString      = @"OMNICAM1";
-NSString * const OCAppVersionString = @"1.1.4";
+NSString * const OCAppVersionString = @"1.1.5";
 
 static const NSUInteger OCMaxLineBytes = 64 * 1024; // §2 max message 64 KiB
 static const double OCAbrFloorKbps = 500.0;         // §6
+static void * const kOCClientQueueKey = (void *)&kOCClientQueueKey;
 
 #define OC_ATOMIC_ADD(v, d) __atomic_add_fetch(&(v), (d), __ATOMIC_RELAXED)
 #define OC_ATOMIC_LOAD(v)   __atomic_load_n(&(v), __ATOMIC_RELAXED)
@@ -105,6 +106,7 @@ static NSString *ocDeviceModel(void) {
     _udpQueue = dispatch_queue_create("oc.net.udp", DISPATCH_QUEUE_SERIAL);
     _listenQueue = dispatch_queue_create("oc.net.listen", DISPATCH_QUEUE_SERIAL);
     _clientQueue = dispatch_queue_create("oc.net.client", DISPATCH_QUEUE_SERIAL);
+    dispatch_queue_set_specific(_clientQueue, kOCClientQueueKey, kOCClientQueueKey, NULL);
     _beaconQueue = dispatch_queue_create("oc.net.beacon", DISPATCH_QUEUE_SERIAL);
     return self;
 }
@@ -467,26 +469,40 @@ static NSString *ocDeviceModel(void) {
     }
 }
 
+/// Write one TCP line. Never close the control socket from a send failure —
+/// that is what made Stop Stream look like connect/disconnect on the HUD.
+/// Recv EOF still tears the client down. Bounded EAGAIN so this cannot stall
+/// the client queue forever.
+static BOOL ocTcpSendAll(int fd, const uint8_t *p, size_t left) {
+    if (fd < 0 || !p || left == 0) return NO;
+    int spins = 0;
+    while (left > 0) {
+        ssize_t n = send(fd, p, left, 0);
+        if (n > 0) {
+            p += (size_t)n;
+            left -= (size_t)n;
+            spins = 0;
+            continue;
+        }
+        if (n < 0 && errno == EINTR) continue;
+        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK) && spins < 40) {
+            usleep(1000);
+            spins++;
+            continue;
+        }
+        NSLog(@"[OmniCam] TCP send failed (%s) — keeping control connection",
+              (n < 0) ? strerror(errno) : "short write");
+        return NO;
+    }
+    return YES;
+}
+
 - (void)sendTcpLine:(NSString *)line {
     dispatch_async(_clientQueue, ^{
         if (self->_clientSock == -1) return;
         NSMutableData *d = [[line dataUsingEncoding:NSUTF8StringEncoding] mutableCopy];
         [d appendBytes:"\n" length:1];
-        const uint8_t *p = d.bytes;
-        size_t left = d.length;
-        while (left > 0) {
-            ssize_t n = send(self->_clientSock, p, left, 0);
-            if (n <= 0) {
-                if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) {
-                    if (errno == EAGAIN || errno == EWOULDBLOCK) usleep(1000);
-                    continue;
-                }
-                [self closeClientSocket];
-                return;
-            }
-            p += n;
-            left -= (size_t)n;
-        }
+        ocTcpSendAll(self->_clientSock, d.bytes, d.length);
     });
 }
 
@@ -505,8 +521,10 @@ static NSString *ocDeviceModel(void) {
 - (void)sendJson:(NSDictionary *)json {
     NSData *line = [self jsonLine:json];
     if (!line) return;
-    // Always hop to the client queue (FIFO) so replies from UI-thread callers,
-    // handlers and timers keep strict wire order.
+    if (dispatch_get_specific(kOCClientQueueKey)) {
+        [self sendNow:line];
+        return;
+    }
     dispatch_async(_clientQueue, ^{
         [self sendNow:line];
     });
@@ -514,21 +532,7 @@ static NSString *ocDeviceModel(void) {
 
 - (void)sendNow:(NSData *)line {
     if (_clientSock == -1) return;
-    const uint8_t *p = line.bytes;
-    size_t left = line.length;
-    while (left > 0) {
-        ssize_t n = send(_clientSock, p, left, 0);
-        if (n <= 0) {
-            if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) {
-                if (errno == EAGAIN || errno == EWOULDBLOCK) usleep(1000);
-                continue;
-            }
-            [self closeClientSocket];
-            return;
-        }
-        p += n;
-        left -= (size_t)n;
-    }
+    ocTcpSendAll(_clientSock, line.bytes, line.length);
 }
 
 - (void)sendError:(NSString *)code {
@@ -970,23 +974,25 @@ static NSString *ocDeviceModel(void) {
 
 // Caller holds _streamLock.
 - (void)stopStreamingLocked {
-    if (!_streaming) return;
+    BOOL wasStreaming = _streaming;
     _streaming = NO;
     _destValid = NO;
     _streamWidth = _streamHeight = 0;
     OCEncoder *e = _encoder;
-    if (e) [e stop];
+    if (wasStreaming && e) [e stop]; // async VT teardown — must not block this queue
     OCPacker *pk = _packer;
     if (pk) [pk endStream];
-    [self sendJson:@{@"t" : @"stopped"}];
+    [self sendJson:@{@"t" : @"stopped"}]; // idempotent ack even if already idle
 
-    id<OCNetManagerDelegate> d = _delegate;
-    if (d && [d respondsToSelector:@selector(netManagerStreamingStateDidChange:)]) {
-        dispatch_async(dispatch_get_main_queue(), ^{
-            [d netManagerStreamingStateDidChange:self];
-        });
+    if (wasStreaming) {
+        id<OCNetManagerDelegate> d = _delegate;
+        if (d && [d respondsToSelector:@selector(netManagerStreamingStateDidChange:)]) {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                [d netManagerStreamingStateDidChange:self];
+            });
+        }
+        NSLog(@"[OmniCam] streaming stopped");
     }
-    NSLog(@"[OmniCam] streaming stopped");
 }
 
 - (void)setBitrateCeilingKbps:(int)kbps {

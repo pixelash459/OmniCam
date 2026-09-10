@@ -212,16 +212,17 @@ static void OCEncodeOutputCallback(void *outputCallbackRefCon,
 }
 
 - (void)stop {
-    dispatch_sync(_vtQueue, ^{
+    _running = NO; // visible to encodePixelBuffer immediately
+    dispatch_async(_vtQueue, ^{
         [self stopLocked];
     });
 }
 
 - (void)stopLocked {
+    _running = NO;
     if (!_session) return;
-    // Flush pending frames so their callbacks fire before teardown.
-    OSStatus st = VTCompressionSessionCompleteFrames(_session, kCMTimeInvalid);
-    if (st != noErr) NSLog(@"[OmniCam] CompleteFrames: %d", (int)st);
+    // Do not CompleteFrames: capture keeps running for preview, so VT may
+    // never drain, and on iOS 12 that call can hang or glitch the session.
     VTCompressionSessionInvalidate(_session);
     CFRelease(_session);
     _session = NULL;
@@ -229,7 +230,6 @@ static void OCEncodeOutputCallback(void *outputCallbackRefCon,
         CFRelease(_pool);
         _pool = NULL;
     }
-    _running = NO;
     _cachedSPS = nil;
     _cachedPPS = nil;
     NSLog(@"[OmniCam] encoder stopped");
@@ -278,6 +278,7 @@ static void OCEncodeOutputCallback(void *outputCallbackRefCon,
 }
 
 - (void)encodePixelBuffer:(CVPixelBufferRef)buffer timestamp:(CMTime)pts {
+    if (!_running) return; // stop is in flight / idle preview — don't queue encodes
     CFRetain(buffer); // held across the async hop to _vtQueue
     dispatch_async(_vtQueue, ^{
         [self encodeLocked:buffer timestamp:pts];

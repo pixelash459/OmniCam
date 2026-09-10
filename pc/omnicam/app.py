@@ -305,9 +305,21 @@ class OmniCamApp:
         return ok
 
     def stop_stream(self) -> None:
-        """Send ``stop`` and tear the decode/output pipeline down."""
-        self.control.send_stop()
+        """Send ``stop`` and tear the decode/output pipeline down.
+
+        TCP stays up (Disconnect is ``bye``). Media feedback must stop immediately
+        or the phone keeps handling NACK/PLI and the HUD glitches.
+        """
+        was = False
+        with self._stream_lock:
+            was = self._streaming
+            self._streaming = False
+        if was:
+            self.control.send_stop()
+        self.video_rx.pause_feedback()
         self._teardown_stream()
+        if was:
+            self._emit("stopped", {"local": True})
 
     def set_camera(self, camera_id: str) -> None:
         """Switch the phone camera ('front' or 'back')."""
@@ -411,7 +423,8 @@ class OmniCamApp:
             self._emit("stopped", {})
         elif kind == "camera_ok":
             self._camera = str(msg.get("id", self._camera))
-            self.request_idr()
+            if self._streaming:
+                self.request_idr()
             self._emit("camera_ok", dict(msg))
         elif kind == "bitrate_ok":
             self._emit("bitrate_ok", dict(msg))

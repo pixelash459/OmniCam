@@ -886,6 +886,10 @@ didPickDocumentsAtURLs:(NSArray<NSURL *> *)urls {
     _statusLabel.text = streaming
         ? [NSString stringWithFormat:@"live → %@", manager.clientAddress ?: @""]
         : (_netManager.clientConnected ? @"PC connected" : @"no PC");
+    if (!streaming) {
+        _statsLabel.text = @"idle";
+        _bitrateLabel.text = @"";
+    }
 }
 
 - (void)netManager:(OCNetManager *)manager activeCameraDidChange:(NSString *)cameraId {

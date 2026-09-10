@@ -304,6 +304,8 @@ static inline void ocSetMarker(NSMutableData *pkt) {
 
 - (void)processFeedbackBytes:(const uint8_t *)bytes length:(NSUInteger)length {
     if (!bytes || length < 12) return;
+    OCNetManager *net = _network;
+    if (!net.isStreaming) return; // ignore NACK/PLI after PC Stop Stream
     uint8_t version = bytes[0] >> 6;
     if (version != 2) return;
     uint8_t fmt = bytes[0] & 0x1F;
