@@ -1,5 +1,7 @@
 # --- Python (PC client) ---
 pc/.venv/
+pc/build/
+pc/dist/
 __pycache__/
 *.py[cod]
 *.egg-info/

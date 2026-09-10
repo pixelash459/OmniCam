@@ -8,6 +8,14 @@ low-latency in-process (PyAV/FFmpeg), shows a preview, and mirrors it into
 Video-only — audio is intentionally not implemented (v1.1); use your own
 microphone in the consumer app.
 
+## Ready-made .exe (no Python needed)
+
+A compiled, tested **OmniCam-PC-1.1.0-windows.exe** is on the Releases page:
+<https://github.com/pixelash459/OmniCam/releases/tag/v1.1.0> — download,
+double-click, done (still install OBS Studio for webcam output; allow the
+firewall prompt; SmartScreen may need *More info → Run anyway* since the exe
+is unsigned). To rebuild it yourself after code changes, run `build-exe.bat`.
+
 ## 0. Fresh laptop setup (from a clone of this repo)
 
 ```bat

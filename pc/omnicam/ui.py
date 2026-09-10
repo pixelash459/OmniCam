@@ -76,9 +76,9 @@ def make_dark_palette() -> QPalette:
     p.setColor(QPalette.ColorRole.BrightText, QColor(255, 80, 80))
     p.setColor(QPalette.ColorRole.Highlight, QColor(0, 120, 215))
     p.setColor(QPalette.ColorRole.HighlightedText, QColor(255, 255, 255))
-    p.setColor(QPalette.ColorRole.Disabled, QPalette.ColorRole.Text, disabled)
-    p.setColor(QPalette.ColorRole.Disabled, QPalette.ColorRole.ButtonText, disabled)
-    p.setColor(QPalette.ColorRole.Disabled, QPalette.ColorRole.WindowText, disabled)
+    p.setColor(QPalette.ColorGroup.Disabled, QPalette.ColorRole.Text, disabled)
+    p.setColor(QPalette.ColorGroup.Disabled, QPalette.ColorRole.ButtonText, disabled)
+    p.setColor(QPalette.ColorGroup.Disabled, QPalette.ColorRole.WindowText, disabled)
     return p
 
 

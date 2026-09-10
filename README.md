@@ -25,7 +25,7 @@ Turn your **jailbroken iPhone** into a wireless webcam for your **Windows PC** �
 
 1. **A tested .ipa is already built**: `dist/OmniCam.ipa` (arm64, iOS 12.0, ldid fake-signed). To rebuild after changes: [WSL + Theos](INSTALL.md) (offline, recommended): `wsl bash scripts/build-wsl.sh`; or push to GitHub and let the included Action build it.
 2. **Install** — Filza web server (`http://<phone-ip>:2222`) → upload the .ipa → tap → Install. No certificate, no 7-day timer (AppSync Unified).
-3. **PC** — `cd pc && python -m venv .venv && .venv\Scripts\pip install -r requirements.txt` and install [OBS Studio](https://obsproject.com) (for the virtual camera). Run `run.bat`.
+3. **PC** — easiest: download `OmniCam-PC-1.1.0-windows.exe` from the [Releases page](https://github.com/pixelash459/OmniCam/releases) and double-click (install [OBS Studio](https://obsproject.com) once for the virtual camera). From source instead: `cd pc`, create a venv, `pip install -r requirements.txt`, then `run.bat`.
 4. **Stream** — open OmniCam on the phone, OmniCam PC on the desktop, click the device → Connect → Start Stream, then pick "OBS Virtual Camera" in Zoom/Teams/OBS.
 
 > ⚠️ The app only launches **while jailbroken** — after every reboot, re-jailbreak first (Safari → `jbme.h4ck.kr`, ~20 s), then open OmniCam.

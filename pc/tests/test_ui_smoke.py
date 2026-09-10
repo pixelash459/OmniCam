@@ -27,9 +27,10 @@ def _pump(app, seconds: float) -> None:
 def test_main_window_constructs_pumps_and_closes():
     from PySide6.QtWidgets import QApplication
 
-    from omnicam.ui import MainWindow
+    from omnicam.ui import MainWindow, make_dark_palette
 
     app = QApplication.instance() or QApplication([])
+    app.setPalette(make_dark_palette())  # main() applies this before the window
     win = MainWindow()
     try:
         win.show()
