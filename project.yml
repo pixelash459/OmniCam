@@ -1,0 +1,86 @@
+# OmniCam — XcodeGen project spec (backup build path: GitHub Actions, Xcode 15.4)
+#
+# NOTE: XcodeGen REWRITES the plist at targets.OmniCam.info.path on every
+# `xcodegen generate` (auto-generated keys + the properties below). All keys
+# are therefore specified explicitly as literal values so the rewritten file
+# stays byte-stable AND remains valid for the Theos build (ios/Makefile uses
+# the very same ios/Resources/Info.plist; Theos cannot expand build-setting
+# references like $(PRODUCT_BUNDLE_IDENTIFIER), so literals are mandatory).
+
+name: OmniCam
+options:
+  createIntermediateGroups: true
+  deploymentTarget:
+    iOS: "12.0"
+
+settings:
+  base:
+    PRODUCT_BUNDLE_IDENTIFIER: local.omnicam.app
+    PRODUCT_NAME: OmniCam
+    TARGETED_DEVICE_FAMILY: "1"          # iPhone only (iPhone 6 Plus)
+    CLANG_ENABLE_OBJC_ARC: "YES"         # pure Objective-C, no Swift
+    MARKETING_VERSION: "1.1.0"
+    CURRENT_PROJECT_VERSION: "1.1.0"
+    ENABLE_BITCODE: "NO"
+    # Code signing off (sideload target; ldid fake-signs the products)
+    CODE_SIGNING_ALLOWED: "NO"
+    CODE_SIGNING_REQUIRED: "NO"
+    CODE_SIGN_IDENTITY: ""
+
+targets:
+  OmniCam:
+    type: application
+    platform: iOS
+    deploymentTarget: "12.0"
+    sources:
+      - path: ios/src
+      - path: ios/Resources
+        buildPhase: resources            # LaunchScreen.storyboard; Info.plist is
+                                         # never added to build phases by XcodeGen
+    info:
+      path: ios/Resources/Info.plist
+      properties:
+        CFBundleDevelopmentRegion: en
+        CFBundleDisplayName: OmniCam
+        CFBundleExecutable: OmniCam
+        CFBundleIdentifier: local.omnicam.app
+        CFBundleInfoDictionaryVersion: "6.0"
+        CFBundleName: OmniCam
+        CFBundlePackageType: APPL
+        CFBundleShortVersionString: "1.1.0"
+        CFBundleSignature: "????"
+        CFBundleSupportedPlatforms: [iPhoneOS]
+        CFBundleVersion: "1.1.0"
+        LSRequiresIPhoneOS: true
+        MinimumOSVersion: "12.0"
+        UIDeviceFamily: [1]
+        UILaunchStoryboardName: LaunchScreen
+        UIRequiresFullScreen: true
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
+        NSCameraUsageDescription: OmniCam streams the camera over Wi-Fi to your PC.
+        UIFileSharingEnabled: true
+        LSSupportsOpeningDocumentsInPlace: true
+        CFBundleDocumentTypes:
+          - CFBundleTypeName: Cube LUT
+            CFBundleTypeRole: Viewer
+            LSHandlerRank: Owner
+            LSItemContentTypes: [local.omnicam.cube]
+        UTImportedTypeDeclarations:
+          - UTTypeIdentifier: local.omnicam.cube
+            UTTypeDescription: Cube LUT
+            UTTypeConformsTo: [public.data]
+            UTTypeTagSpecification:
+              public.filename-extension: [cube]
+
+schemes:
+  OmniCam:
+    build:
+      targets:
+        OmniCam: all
+    run:
+      config: Debug
+    archive:
+      config: Release

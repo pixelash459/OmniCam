@@ -1,0 +1,11 @@
+# Normalize everything to LF on checkout — CRLF breaks `make`, bash scripts and
+# the WSL build (this actually happened during development). Batch files are the
+# only exception (cmd.exe wants CRLF).
+* text=auto eol=lf
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# Binaries
+*.ipa binary
+*.png binary
+*.icu binary

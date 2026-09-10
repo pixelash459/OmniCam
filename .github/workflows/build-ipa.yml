@@ -1,0 +1,83 @@
+name: Build unsigned IPA
+
+# ---------------------------------------------------------------------------
+# NOTE: macos-14 is DEPRECATED on GitHub Actions (scheduled for retirement).
+# The long-term plan is to build with Theos inside WSL on the user's machine
+# (scripts/build-wsl.sh) — fully offline from Apple, no Mac runner needed.
+# This workflow exists as the backup path because it is the last image family
+# that ships Xcode 15.x — the newest Xcode that can target iOS 12.
+# ---------------------------------------------------------------------------
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - '*'
+
+jobs:
+  build-ipa:
+    runs-on: macos-14   # last image with Xcode 15.x
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Select Xcode 15.4 (last version supporting iOS 12 deployment)
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: '15.4'
+
+      - name: Install xcodegen and ldid
+        run: brew install xcodegen ldid
+
+      - name: Generate Xcode project
+        run: xcodegen generate
+
+      - name: Build (unsigned, arm64, iOS 12.0)
+        run: |
+          set -o pipefail
+          xcodebuild -project OmniCam.xcodeproj \
+            -scheme OmniCam \
+            -sdk iphoneos \
+            -configuration Release \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
+            ARCHS=arm64 \
+            IPHONEOS_DEPLOYMENT_TARGET=12.0 \
+            -derivedDataPath build build | tail -n 40
+          # If the generated scheme ever misbehaves, fall back to -target:
+          # xcodebuild -project OmniCam.xcodeproj -target OmniCam -sdk iphoneos \
+          #   -configuration Release CODE_SIGNING_ALLOWED=NO \
+          #   CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" ARCHS=arm64 \
+          #   IPHONEOS_DEPLOYMENT_TARGET=12.0 -derivedDataPath build build
+
+      - name: Assemble Payload and fake-sign with ldid
+        run: |
+          set -e
+          APP="build/Build/Products/Release-iphoneos/OmniCam.app"
+          test -d "$APP"
+          rm -rf Payload OmniCam.ipa
+          mkdir -p Payload
+          cp -R "$APP" Payload/OmniCam.app
+          # Fake-sign embedded frameworks/dylibs first, then the main binary.
+          # ldid -S (ad-hoc, no entitlements) is what AppSync Unified expects;
+          # it also avoids the known iOS 12.4 launch-crash with fully unsigned
+          # binaries.
+          if [ -d Payload/OmniCam.app/Frameworks ]; then
+            for fw in Payload/OmniCam.app/Frameworks/*.framework; do
+              [ -e "$fw" ] || continue
+              ldid -S "$fw/$(basename "${fw%.*}")"
+            done
+            for dy in Payload/OmniCam.app/Frameworks/*.dylib; do
+              [ -e "$dy" ] || continue
+              ldid -S "$dy"
+            done
+          fi
+          ldid -S Payload/OmniCam.app/OmniCam
+          ldid -e Payload/OmniCam.app/OmniCam >/dev/null 2>&1 || true
+          zip -qry OmniCam.ipa Payload
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: OmniCam-unsigned.ipa
+          path: OmniCam.ipa
+          if-no-files-found: error

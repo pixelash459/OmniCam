@@ -1,0 +1,9 @@
+# OmniCam PC receiver - pinned dependencies (Python 3.11+ / tested on 3.13)
+# PySide6   : Qt 6 UI (QApplication, QMainWindow, dark palette)
+# av        : PyAV - in-process FFmpeg (H.264 low-latency decode)
+# pyvirtualcam : feeds OBS Virtual Camera ('obs' backend) / Unity Capture fallback
+# numpy     : frame buffers and CPU local adjustments (>= 2.1 required for cp313)
+PySide6==6.8.1.1
+av==18.1.0
+pyvirtualcam==0.13.0
+numpy==2.3.4

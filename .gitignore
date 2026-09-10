@@ -1,0 +1,27 @@
+# --- Python (PC client) ---
+pc/.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# --- Theos build artifacts (iOS) ---
+ios/.theos/
+ios/obj/
+packages/
+
+# --- Xcode / XcodeGen (CI path) ---
+build/
+OmniCam.xcodeproj/
+*.xcuserdata
+DerivedData/
+
+# --- OS junk ---
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# --- Editors ---
+.vscode/
+.idea/
+*.swp
