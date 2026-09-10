@@ -41,6 +41,10 @@ NS_ASSUME_NONNULL_BEGIN
 
 - (void)stop;
 
+/// Stop submitting frames but keep the VT session (preview/capture stay alive).
+/// Safe to call from the TCP/UI thread — does not Invalidate VideoToolbox.
+- (void)pauseEncoding;
+
 /// May be called from any thread (serialized internally). If the buffer dimensions
 /// differ from the session, the session is recreated automatically.
 - (void)encodePixelBuffer:(CVPixelBufferRef _Nonnull)buffer timestamp:(CMTime)pts;

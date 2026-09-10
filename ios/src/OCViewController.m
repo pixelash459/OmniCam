@@ -211,8 +211,10 @@ static UIColor *OCAccent(void) {
 }
 
 - (void)appBackgrounded:(NSNotification *)n {
-    // Capture cannot run in background (no bg modes): drop the stream cleanly.
+    // No background camera entitlement. Leaving AVCapture + VT running is what
+    // produced SpringBoard 0x8badf00d / "Suspending" assertion crashes on iOS 12.
     if (_netManager.streaming) [_netManager stopStreaming];
+    [_captureEngine stop];
 }
 
 - (void)appActive:(NSNotification *)n {
@@ -684,7 +686,9 @@ static UIColor *OCAccent(void) {
 
 - (void)startStopTapped:(UIButton *)sender {
     if (_netManager.streaming) {
+        sender.enabled = NO;
         [_netManager stopStreaming];
+        sender.enabled = YES;
         return;
     }
     if (!_netManager.clientConnected) {

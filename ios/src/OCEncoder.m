@@ -90,12 +90,14 @@ static void OCEncodeOutputCallback(void *outputCallbackRefCon,
 }
 
 - (void)dealloc {
-    if (_session) {
-        VTCompressionSessionInvalidate(_session);
-        CFRelease(_session);
-        _session = NULL;
+    _running = NO;
+    // Must CompleteFrames + Invalidate on _vtQueue. Doing it here (any thread)
+    // while EncodeFrame was in flight crashed iOS 12 / hung process-exit (0x8badf00d).
+    if (_vtQueue) {
+        dispatch_sync(_vtQueue, ^{
+            [self stopLocked];
+        });
     }
-    if (_pool) CFRelease(_pool);
 }
 
 - (BOOL)isRunning { return _running; }
@@ -212,17 +214,26 @@ static void OCEncodeOutputCallback(void *outputCallbackRefCon,
 }
 
 - (void)stop {
-    _running = NO; // visible to encodePixelBuffer immediately
+    _running = NO;
     dispatch_async(_vtQueue, ^{
         [self stopLocked];
+    });
+}
+
+- (void)pauseEncoding {
+    _running = NO;
+    dispatch_async(_vtQueue, ^{
+        self->_running = NO;
     });
 }
 
 - (void)stopLocked {
     _running = NO;
     if (!_session) return;
-    // Do not CompleteFrames: capture keeps running for preview, so VT may
-    // never drain, and on iOS 12 that call can hang or glitch the session.
+    // Drain in-flight encodes before Invalidate — skipping this crashed OmniCam
+    // on iOS 12 when the phone STOP button ran while VT still had frames.
+    OSStatus st = VTCompressionSessionCompleteFrames(_session, kCMTimeInvalid);
+    if (st != noErr) NSLog(@"[OmniCam] CompleteFrames: %d", (int)st);
     VTCompressionSessionInvalidate(_session);
     CFRelease(_session);
     _session = NULL;
@@ -337,6 +348,7 @@ static void OCEncodeOutputCallback(void *outputCallbackRefCon,
         return;
     }
     OCEncoder *enc = (__bridge OCEncoder *)outputCallbackRefCon;
+    if (!enc || !enc->_running) return;
     CFRetain(sampleBuffer);
     dispatch_async(enc->_cbQueue, ^{
         [enc handleOutputSampleBuffer:sampleBuffer];
@@ -345,6 +357,7 @@ static void OCEncodeOutputCallback(void *outputCallbackRefCon,
 }
 
 - (void)handleOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer {
+    if (!_running) return;
     id<OCEncoderDelegate> d = _delegate;
     if (!d) return;
 

@@ -209,6 +209,7 @@ def test_app_layer_parses_started_without_audio_fields(phone: FakePhone):
         app._on_message({"t": "pong", "ts": 1})  # unknown ts: ignored, no crash
         app._on_message({"t": "stopped"})
         assert app.streaming is False
+        assert app.video_rx._feedback_addr is None
     finally:
         app.shutdown()
 

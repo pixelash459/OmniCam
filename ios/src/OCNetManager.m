@@ -24,7 +24,7 @@ const int OCVideoPort   = 9921;
 const int OCControlPort = 9923;
 
 NSString * const OCMagicString      = @"OMNICAM1";
-NSString * const OCAppVersionString = @"1.1.6";
+NSString * const OCAppVersionString = @"1.1.7";
 
 static const NSUInteger OCMaxLineBytes = 64 * 1024; // §2 max message 64 KiB
 static const double OCAbrFloorKbps = 500.0;         // §6
@@ -85,6 +85,7 @@ static NSString *ocDeviceModel(void) {
 @property (nonatomic, copy, nullable) NSString *clientAddress;
 @property (nonatomic, assign) BOOL abrAuto;
 @property (nonatomic, copy) NSString *deviceModel;
+- (void)haltStreamLockedNotifyPC:(BOOL)notifyPC;
 @end
 
 @implementation OCNetManager
@@ -911,8 +912,9 @@ static BOOL ocTcpSendAll(int fd, const uint8_t *p, size_t left) {
         return NO;
     }
 
-    // Already holding _streamLock (startStreamingToAddress) — use the locked variant.
-    if (_streaming) [self stopStreamingLocked];
+    // Already holding _streamLock (startStreamingToAddress) — halt without
+    // telling the PC `stopped` (we are about to send `started` again).
+    if (_streaming) [self haltStreamLockedNotifyPC:NO];
 
     // Front camera caps at 720p (DECISIONS.md) — clamp silently.
     BOOL isFront = [ce.activeCameraId isEqualToString:@"front"];
@@ -974,23 +976,29 @@ static BOOL ocTcpSendAll(int fd, const uint8_t *p, size_t left) {
 
 - (void)stopStreaming {
     [_streamLock lock];
-    [self stopStreamingLocked];
+    [self haltStreamLockedNotifyPC:YES];
     [_streamLock unlock];
 }
 
 // Caller holds _streamLock.
 - (void)stopStreamingLocked {
+    [self haltStreamLockedNotifyPC:YES];
+}
+
+- (void)haltStreamLockedNotifyPC:(BOOL)notifyPC {
     BOOL wasStreaming = _streaming;
     _streaming = NO;
     _destValid = NO;
     _streamWidth = _streamHeight = 0;
     OCEncoder *e = _encoder;
-    if (wasStreaming && e) [e stop]; // async VT teardown — must not block this queue
+    // Pause only — do not Invalidate VT here. Destroying the session while
+    // capture is still feeding frames crashed the phone app (and the PC then
+    // saw TCP drop / reconnect strobe). Full teardown happens on next start.
+    if (wasStreaming && e) [e pauseEncoding];
     OCPacker *pk = _packer;
     if (pk) [pk endStream];
-    [self sendJson:@{@"t" : @"stopped"}]; // idempotent ack even if already idle
-
-    if (wasStreaming) {
+    if (notifyPC && wasStreaming) {
+        [self sendJson:@{@"t" : @"stopped"}];
         id<OCNetManagerDelegate> d = _delegate;
         if (d && [d respondsToSelector:@selector(netManagerStreamingStateDidChange:)]) {
             dispatch_async(dispatch_get_main_queue(), ^{

@@ -393,6 +393,7 @@ class OmniCamApp:
     def _on_state(self, connected: bool, text: str) -> None:
         self._conn_text = text
         if not connected:
+            self.video_rx.pause_feedback()
             with self._stream_lock:
                 was = self._streaming
             if was:
@@ -419,6 +420,7 @@ class OmniCamApp:
         elif kind == "started":
             self._apply_started(msg)
         elif kind == "stopped":
+            self.video_rx.pause_feedback()
             self._teardown_stream()
             self._emit("stopped", {})
         elif kind == "camera_ok":
