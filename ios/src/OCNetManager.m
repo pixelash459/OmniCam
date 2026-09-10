@@ -24,7 +24,7 @@ const int OCVideoPort   = 9921;
 const int OCControlPort = 9923;
 
 NSString * const OCMagicString      = @"OMNICAM1";
-NSString * const OCAppVersionString = @"1.1.8";
+NSString * const OCAppVersionString = @"1.1.9";
 
 static const NSUInteger OCMaxLineBytes = 64 * 1024; // §2 max message 64 KiB
 static const double OCAbrFloorKbps = 500.0;         // §6
@@ -67,6 +67,8 @@ static NSString *ocDeviceModel(void) {
     int _highLossCount;      // consecutive rr with loss > 10 % (sustained-loss IDR)
     int _fecHighCount, _fecLowCount;
     BOOL _applyingRemoteFilter; // suppress echoing a PC-pushed state back
+    BOOL _applyingRemoteSession; // suppress echoing a PC-pushed §2.3 session
+    int _sessionW, _sessionH, _sessionFps, _sessionKbps; // intended encode session
 
     // stats deltas
     uint32_t _lastFrames, _lastSent, _lastResent;
@@ -88,6 +90,7 @@ static NSString *ocDeviceModel(void) {
 @property (nonatomic, copy) NSString *deviceModel;
 @property (nonatomic, strong) dispatch_queue_t mediaQueue; // start/stop — never block TCP
 - (void)haltStreamLockedNotifyPC:(BOOL)notifyPC;
+- (void)applyRemoteSessionFields:(NSDictionary *)state;
 @end
 
 @implementation OCNetManager
@@ -105,6 +108,10 @@ static NSString *ocDeviceModel(void) {
     _maxBitrateKbps = 3000;
     _currentBitrateKbps = 3000;
     _fps = 30;
+    _sessionW = 1280;
+    _sessionH = 720;
+    _sessionFps = 30;
+    _sessionKbps = 3000;
     _abrAuto = YES; // §6 default
     _udpQueue = dispatch_queue_create("oc.net.udp", DISPATCH_QUEUE_SERIAL);
     _listenQueue = dispatch_queue_create("oc.net.listen", DISPATCH_QUEUE_SERIAL);
@@ -605,6 +612,11 @@ static BOOL ocTcpSendAll(int fd, const uint8_t *p, size_t left) {
         [self handleMessageTorch:m];
     } else if ([t isEqualToString:@"zoom"]) {
         [self handleMessageZoom:m];
+    } else if ([t isEqualToString:@"session"]) {
+        NSDictionary *copy = [m copy];
+        dispatch_async(_mediaQueue, ^{
+            [self handleMessageSession:copy];
+        });
     } else if ([t isEqualToString:@"rr"]) {
         [self handleMessageRr:m];
     } else if ([t isEqualToString:@"ping"]) {
@@ -631,6 +643,7 @@ static BOOL ocTcpSendAll(int fd, const uint8_t *p, size_t left) {
         @"camera" : (ce ? ce.activeCameraId : @"back"),
         @"max_front" : @[@1280, @720, @30],   // §2.2
         @"max_back" : @[@1920, @1080, @60],
+        @"session" : [self sessionDictionary],
         @"filter" : (fs ? fs.dictionaryRepresentation : @{}) ?: @{},
     }];
     id<OCNetManagerDelegate> d = _delegate;
@@ -712,6 +725,7 @@ static BOOL ocTcpSendAll(int fd, const uint8_t *p, size_t left) {
         dispatch_async(self->_clientQueue, ^{
             if (!err) {
                 [self sendJson:@{@"t" : @"camera_ok", @"id" : activeId}]; // §2.2 after the ~150-300 ms gap
+                [self pushSessionState];
             } else {
                 [self sendError:@"badmsg"];
             }
@@ -731,14 +745,17 @@ static BOOL ocTcpSendAll(int fd, const uint8_t *p, size_t left) {
     }
     _abrAuto = NO; // §6: manual bitrate disables auto until abr auto=true
     _currentBitrateKbps = kbps;
+    _sessionKbps = kbps;
     OCEncoder *e = _encoder;
     if (e) [e setBitrateKbps:kbps];
     [self sendJson:@{@"t" : @"bitrate_ok", @"kbps" : @(kbps), @"auto" : @NO}];
+    [self pushSessionState];
 }
 
 - (void)handleMessageAbr:(NSDictionary *)m {
     _abrAuto = [self flagIn:m key:@"auto" def:YES];
     [self sendJson:@{@"t" : @"bitrate_ok", @"kbps" : @(_currentBitrateKbps), @"auto" : @(_abrAuto)}];
+    [self pushSessionState];
 }
 
 - (void)handleMessageFilter:(NSDictionary *)m {
@@ -772,6 +789,7 @@ static BOOL ocTcpSendAll(int fd, const uint8_t *p, size_t left) {
     }
     BOOL actual = [ce applyTorchOn:on];
     [self sendJson:@{@"t" : @"torch_ok", @"on" : @(actual)}]; // actual state (front has no torch)
+    [self pushSessionState];
 }
 
 - (void)handleMessageZoom:(NSDictionary *)m {
@@ -782,6 +800,124 @@ static BOOL ocTcpSendAll(int fd, const uint8_t *p, size_t left) {
         return;
     }
     [ce setZoomFactor:(CGFloat)x]; // clamped to [1, activeFormat max] (§2.1 "clamped by phone")
+    [self pushSessionState];
+}
+
+- (void)handleMessageSession:(NSDictionary *)m {
+    NSDictionary *state = [m valueForKey:@"state"];
+    if (![state isKindOfClass:[NSDictionary class]]) {
+        [self sendError:@"badmsg"];
+        return;
+    }
+    _applyingRemoteSession = YES;
+
+    NSString *camWanted = nil;
+    id camObj = state[@"camera"];
+    if ([camObj isKindOfClass:[NSString class]]) {
+        NSString *c = camObj;
+        if ([c isEqualToString:@"front"] || [c isEqualToString:@"back"]) camWanted = c;
+    }
+
+    __weak typeof(self) wself = self;
+    void (^applyRest)(void) = ^{
+        __strong typeof(self) sself = wself;
+        if (!sself) return;
+        [sself applyRemoteSessionFields:state];
+        NSDictionary *applied = [sself sessionDictionary];
+        dispatch_async(dispatch_get_main_queue(), ^{
+            id<OCNetManagerDelegate> d = sself->_delegate;
+            if (d && [d respondsToSelector:@selector(netManager:didReceiveRemoteSession:)]) {
+                [d netManager:sself didReceiveRemoteSession:applied];
+            }
+            sself->_applyingRemoteSession = NO;
+            [sself pushSessionState];
+        });
+    };
+
+    OCCaptureEngine *ce = _captureEngine;
+    if (camWanted && ce && ![camWanted isEqualToString:ce.activeCameraId]) {
+        [ce switchToCameraId:camWanted completion:^(NSString *activeId, NSError *err) {
+            __strong typeof(self) sself = wself;
+            if (!sself) return;
+            if (!err) {
+                OCEncoder *enc = sself->_encoder;
+                if (enc) [enc forceKeyframe];
+                [sself sendJson:@{@"t" : @"camera_ok", @"id" : activeId}];
+            }
+            id<OCNetManagerDelegate> d = sself->_delegate;
+            if (d && [d respondsToSelector:@selector(netManager:activeCameraDidChange:)]) {
+                [d netManager:sself activeCameraDidChange:activeId];
+            }
+            dispatch_async(sself->_mediaQueue, applyRest);
+        }];
+    } else {
+        applyRest();
+    }
+}
+
+- (void)applyRemoteSessionFields:(NSDictionary *)state {
+    OCCaptureEngine *ce = _captureEngine;
+    int oldW = _sessionW, oldH = _sessionH, oldFps = _sessionFps, oldKbps = _sessionKbps;
+
+    if ([state[@"w"] isKindOfClass:[NSNumber class]]) _sessionW = (int)[state[@"w"] integerValue];
+    if ([state[@"h"] isKindOfClass:[NSNumber class]]) _sessionH = (int)[state[@"h"] integerValue];
+    if ([state[@"fps"] isKindOfClass:[NSNumber class]]) {
+        int fps = (int)[state[@"fps"] integerValue];
+        if (fps > 0) _sessionFps = fps;
+    }
+
+    BOOL hasAbr = [state[@"abr"] isKindOfClass:[NSNumber class]];
+    BOOL hasKbps = [state[@"kbps"] isKindOfClass:[NSNumber class]];
+    BOOL abrVal = hasAbr ? [state[@"abr"] boolValue] : _abrAuto;
+    if (hasKbps) {
+        int kbps = (int)[state[@"kbps"] integerValue];
+        if (kbps > 0) {
+            _sessionKbps = kbps;
+            [self setBitrateCeilingKbps:kbps];
+            if (!hasAbr || !abrVal) {
+                _abrAuto = NO;
+                _currentBitrateKbps = kbps;
+                OCEncoder *e = _encoder;
+                if (e) [e setBitrateKbps:kbps];
+            }
+        }
+    }
+    if (hasAbr) [self enableAutoBitrate:abrVal];
+
+    BOOL isFront = ce && [ce.activeCameraId isEqualToString:@"front"];
+    if (isFront && (_sessionW > 1280 || _sessionH > 720)) {
+        _sessionW = 1280;
+        _sessionH = 720;
+        if (_sessionKbps > 3000) {
+            _sessionKbps = 3000;
+            [self setBitrateCeilingKbps:3000];
+        }
+    }
+    if (ce) [ce setWantsHighResolution:(_sessionH > 720 || _sessionW > 1280)];
+
+    if ([state[@"zoom"] isKindOfClass:[NSNumber class]] && ce) {
+        [ce setZoomFactor:(CGFloat)[state[@"zoom"] doubleValue]];
+    }
+    if ([state[@"torch"] isKindOfClass:[NSNumber class]] && ce) {
+        BOOL wantTorch = [state[@"torch"] boolValue] && !isFront;
+        [ce applyTorchOn:wantTorch];
+    }
+
+    BOOL encodeChanged = (_sessionW != oldW || _sessionH != oldH
+                          || _sessionFps != oldFps || _sessionKbps != oldKbps);
+    if (_streaming && encodeChanged) {
+        NSError *err = nil;
+        BOOL ok = [self startStreamingToConnectedClientWidth:_sessionW
+                                                      height:_sessionH
+                                                         fps:_sessionFps
+                                                        kbps:_sessionKbps
+                                                      keyint:60
+                                                       error:&err];
+        if (!ok) {
+            NSLog(@"[OmniCam] session encoder restart failed: %@", err);
+            [self failOnMain:err.localizedDescription ?: @"Stream restart failed"];
+        }
+    }
 }
 
 - (void)handleMessageRr:(NSDictionary *)m {
@@ -914,12 +1050,25 @@ static BOOL ocTcpSendAll(int fd, const uint8_t *p, size_t left) {
         return NO;
     }
 
+    // Front camera caps at 720p (DECISIONS.md) — clamp before the already-live skip.
+    OCCaptureEngine *ceClamp = _captureEngine;
+    BOOL isFront = ceClamp && [ceClamp.activeCameraId isEqualToString:@"front"];
+    if (isFront && (w > 1280 || h > 720)) {
+        w = 1280;
+        h = 720;
+    }
+
     // Same PC hitting Start again (or a duplicate `start` after welcome) used
     // to stop+restart the encoder every time — HUD START/STOP strobe and a
-    // 1–2 frame black flash. Keep the live session if dest+dims match.
+    // 1–2 frame black flash. Keep the live session if dest+dims+bitrate match.
     if (_streaming && _destValid && _videoPort == videoPort
         && _rtpDest.sin_addr.s_addr == dest.sin_addr.s_addr
-        && _streamWidth == w && _streamHeight == h && _fps == fps) {
+        && _streamWidth == w && _streamHeight == h && _fps == fps
+        && _sessionKbps == kbps) {
+        _sessionW = w;
+        _sessionH = h;
+        _sessionFps = fps;
+        _sessionKbps = kbps;
         NSLog(@"[OmniCam] start ignored (already streaming → %@ :%d)", ip, videoPort);
         OCPacker *pk = _packer;
         [self sendJson:@{
@@ -928,6 +1077,7 @@ static BOOL ocTcpSendAll(int fd, const uint8_t *p, size_t left) {
             @"ssrc_fec" : @(pk ? pk.ssrcFEC : 0),
             @"fec" : @(pk ? pk.isFecEnabled : NO),
         }];
+        [self pushSessionState];
         return YES;
     }
 
@@ -944,13 +1094,6 @@ static BOOL ocTcpSendAll(int fd, const uint8_t *p, size_t left) {
     // telling the PC `stopped` (we are about to send `started` again).
     if (_streaming) [self haltStreamLockedNotifyPC:NO];
 
-    // Front camera caps at 720p (DECISIONS.md) — clamp silently.
-    BOOL isFront = [ce.activeCameraId isEqualToString:@"front"];
-    if (isFront && (w > 1280 || h > 720)) {
-        w = 1280;
-        h = 720;
-    }
-
     // Reset SSRC/seq and set the UDP destination BEFORE any frame can be packed:
     // the encoder starts producing immediately once wired to the pipeline.
     _rtpDest = dest;
@@ -958,8 +1101,8 @@ static BOOL ocTcpSendAll(int fd, const uint8_t *p, size_t left) {
     _videoPort = videoPort;
     [pk beginStream];
 
+    [ce setWantsHighResolution:(w > 1280 || h > 720)];
     if (![ce isRunning]) {
-        [ce setWantsHighResolution:(w > 1280 || h > 720)];
         if (![ce startAndReturnError:error]) {
             _destValid = NO;
             [pk endStream];
@@ -977,6 +1120,10 @@ static BOOL ocTcpSendAll(int fd, const uint8_t *p, size_t left) {
     _fps = fps;
     _streamWidth = w;
     _streamHeight = h;
+    _sessionW = w;
+    _sessionH = h;
+    _sessionFps = fps;
+    _sessionKbps = kbps;
     _maxBitrateKbps = kbps; // ABR cap = configured bitrate (§6)
     _currentBitrateKbps = kbps;
     _highLossCount = 0;
@@ -999,6 +1146,7 @@ static BOOL ocTcpSendAll(int fd, const uint8_t *p, size_t left) {
         });
     }
     NSLog(@"[OmniCam] streaming → %@ (%dx%d@%d, %d kbps)", ip, w, h, fps, kbps);
+    [self pushSessionState];
     return YES;
 }
 
@@ -1057,6 +1205,49 @@ static BOOL ocTcpSendAll(int fd, const uint8_t *p, size_t left) {
     _abrAuto = enable;
     OCEncoder *e = _encoder;
     if (!enable && e) [e setBitrateKbps:_currentBitrateKbps];
+}
+
+#pragma mark Session (§2.3)
+
+- (NSDictionary *)sessionDictionary {
+    OCCaptureEngine *ce = _captureEngine;
+    NSString *cam = (ce && ce.activeCameraId.length) ? ce.activeCameraId : @"back";
+    BOOL torch = ce ? ce.torchOn : NO;
+    double zoom = ce ? (double)ce.zoomFactor : 1.0;
+    int kbps = _abrAuto ? _sessionKbps : _currentBitrateKbps;
+    return @{
+        @"camera" : cam,
+        @"w" : @(_sessionW),
+        @"h" : @(_sessionH),
+        @"fps" : @(_sessionFps),
+        @"kbps" : @(kbps),
+        @"abr" : @(_abrAuto),
+        @"torch" : @(torch),
+        @"zoom" : @(zoom),
+    };
+}
+
+- (void)pushSessionState {
+    if (_applyingRemoteSession) return;
+    if (_clientSock == -1) return;
+    [self sendJson:@{@"t" : @"session", @"state" : [self sessionDictionary]}];
+}
+
+- (void)noteLocalCameraId:(NSString *)cid {
+    NSString *idStr = cid.length ? cid : (_captureEngine.activeCameraId ?: @"back");
+    [self sendJson:@{@"t" : @"camera_ok", @"id" : idStr}];
+    [self pushSessionState];
+}
+
+- (void)notifyLocalResolutionHD:(BOOL)hd {
+    OCCaptureEngine *ce = _captureEngine;
+    if (hd && ce && [ce.activeCameraId isEqualToString:@"front"]) hd = NO;
+    _sessionW = hd ? 1920 : 1280;
+    _sessionH = hd ? 1080 : 720;
+    _sessionFps = 30;
+    _sessionKbps = hd ? 6000 : 3000;
+    [self setBitrateCeilingKbps:_sessionKbps];
+    [self pushSessionState];
 }
 
 #pragma mark Filter push

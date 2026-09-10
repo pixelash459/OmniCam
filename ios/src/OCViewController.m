@@ -696,12 +696,17 @@ static UIColor *OCAccent(void) {
         return;
     }
     sender.enabled = NO;
+    BOOL hd = (_resControl.selectedSegmentIndex == 1)
+        && ![_captureEngine.activeCameraId isEqualToString:@"front"];
+    int w = hd ? 1920 : 1280;
+    int h = hd ? 1080 : 720;
+    int kbps = hd ? 6000 : 3000;
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         NSError *err = nil;
-        BOOL ok = [_netManager startStreamingToConnectedClientWidth:1280
-                                                             height:720
+        BOOL ok = [_netManager startStreamingToConnectedClientWidth:w
+                                                             height:h
                                                                 fps:30
-                                                               kbps:3000
+                                                               kbps:kbps
                                                              keyint:60
                                                               error:&err];
         dispatch_async(dispatch_get_main_queue(), ^{
@@ -721,6 +726,7 @@ static UIColor *OCAccent(void) {
             sender.enabled = YES;
             if (err) _statusLabel.text = err.localizedDescription;
             [self refreshCameraControls];
+            if (!err) [_netManager noteLocalCameraId:activeId];
         });
     }];
 }
@@ -728,21 +734,24 @@ static UIColor *OCAccent(void) {
 - (void)torchTapped:(UIButton *)sender {
     BOOL applied = [_captureEngine applyTorchOn:!_captureEngine.torchOn];
     [sender setTitle:applied ? @"TORCH\u2713" : @"TORCH" forState:UIControlStateNormal];
+    [_netManager pushSessionState];
 }
 
 - (void)resChanged:(UISegmentedControl *)seg {
     BOOL hd = (seg.selectedSegmentIndex == 1);
     [_captureEngine setWantsHighResolution:hd];
-    [_netManager setBitrateCeilingKbps:hd ? 6000 : 3000]; // §6 defaults per resolution
+    [_netManager notifyLocalResolutionHD:hd]; // §6 defaults + push session
 }
 
 - (void)abrToggled:(UISwitch *)sw {
     [_netManager enableAutoBitrate:sw.on];
+    [_netManager pushSessionState];
 }
 
 - (void)cameraZoomChanged:(UISlider *)slider {
     [_captureEngine setZoomFactor:slider.value];
     _zoomValueLabel.text = [NSString stringWithFormat:@"%.1fx", slider.value];
+    [_netManager pushSessionState];
 }
 
 - (void)panelToggled:(UIButton *)sender {
@@ -763,6 +772,7 @@ static UIColor *OCAccent(void) {
     if (front && _resControl.selectedSegmentIndex == 1) {
         _resControl.selectedSegmentIndex = 0;
         [_captureEngine setWantsHighResolution:NO];
+        [_netManager notifyLocalResolutionHD:NO];
     }
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         CGFloat maxZ = _captureEngine.maxZoomFactor;
@@ -913,6 +923,39 @@ didPickDocumentsAtURLs:(NSArray<NSURL *> *)urls {
 - (void)netManager:(OCNetManager *)manager didReceiveRemoteFilterState:(OCFilterState *)state {
     [self applyStateToUI]; // state object already mutated; sync the controls
     [self updatePreviewMode];
+}
+
+- (void)netManager:(OCNetManager *)manager didReceiveRemoteSession:(NSDictionary *)state {
+    [_resControl removeTarget:self action:@selector(resChanged:) forControlEvents:UIControlEventValueChanged];
+    [_abrSwitch removeTarget:self action:@selector(abrToggled:) forControlEvents:UIControlEventValueChanged];
+    [_cameraZoomSlider removeTarget:self action:@selector(cameraZoomChanged:) forControlEvents:UIControlEventValueChanged];
+
+    int h = 720;
+    id hObj = state[@"h"];
+    if ([hObj isKindOfClass:[NSNumber class]]) h = (int)[hObj integerValue];
+    _resControl.selectedSegmentIndex = (h >= 1080) ? 1 : 0;
+
+    id abrObj = state[@"abr"];
+    if ([abrObj isKindOfClass:[NSNumber class]]) _abrSwitch.on = [abrObj boolValue];
+
+    id torchObj = state[@"torch"];
+    if ([torchObj isKindOfClass:[NSNumber class]]) {
+        [_torchButton setTitle:[torchObj boolValue] ? @"TORCH\u2713" : @"TORCH"
+                      forState:UIControlStateNormal];
+    }
+
+    id zoomObj = state[@"zoom"];
+    if ([zoomObj isKindOfClass:[NSNumber class]]) {
+        float z = (float)[zoomObj doubleValue];
+        _cameraZoomSlider.value = z;
+        _zoomValueLabel.text = [NSString stringWithFormat:@"%.1fx", z];
+    }
+
+    [self refreshCameraControls];
+
+    [_resControl addTarget:self action:@selector(resChanged:) forControlEvents:UIControlEventValueChanged];
+    [_abrSwitch addTarget:self action:@selector(abrToggled:) forControlEvents:UIControlEventValueChanged];
+    [_cameraZoomSlider addTarget:self action:@selector(cameraZoomChanged:) forControlEvents:UIControlEventValueChanged];
 }
 
 - (void)netManager:(OCNetManager *)manager didUpdateStatsFps:(double)fps

@@ -95,6 +95,7 @@ class MainWindow(QMainWindow):
 
         self._preview_seq = 0
         self._syncing_filters = False  # guard against push loops while syncing
+        self._syncing_session = False
         self._filter_push_timer = QTimer(self)
         self._filter_push_timer.setSingleShot(True)
         self._filter_push_timer.setInterval(150)
@@ -154,6 +155,9 @@ class MainWindow(QMainWindow):
         self._res_combo = self._mk_combo(form, "Resolution", [f"{w} x {h}" for w, h in RESOLUTIONS], 0)
         self._fps_combo = self._mk_combo(form, "FPS", [str(f) for f in FPSES], 0)
         self._kbps_combo = self._mk_combo(form, "Bitrate", [f"{b} kbps" for b in BITRATES_KBPS], 3)
+        self._res_combo.currentIndexChanged.connect(self._on_session_controls_changed)
+        self._fps_combo.currentIndexChanged.connect(self._on_session_controls_changed)
+        self._kbps_combo.currentIndexChanged.connect(self._on_session_controls_changed)
         self._abr_check = QCheckBox("Auto ABR (phone-side)")
         self._abr_check.setChecked(True)
         self._abr_check.toggled.connect(self._on_abr_toggled)
@@ -179,6 +183,16 @@ class MainWindow(QMainWindow):
         self._torch_check.setEnabled(False)
         self._torch_check.toggled.connect(self._on_torch)
         cam_lay.addWidget(self._torch_check)
+        zoom_row = QHBoxLayout()
+        zoom_row.addWidget(QLabel("Zoom:"))
+        self._zoom_spin = QDoubleSpinBox()
+        self._zoom_spin.setRange(1.0, 8.0)
+        self._zoom_spin.setSingleStep(0.1)
+        self._zoom_spin.setDecimals(2)
+        self._zoom_spin.setValue(1.0)
+        self._zoom_spin.valueChanged.connect(self._on_zoom)
+        zoom_row.addWidget(self._zoom_spin, 1)
+        cam_lay.addLayout(zoom_row)
         self._cam_label = QLabel("camera: -")
         cam_lay.addWidget(self._cam_label)
         lay.addWidget(cam_box)
@@ -240,8 +254,7 @@ class MainWindow(QMainWindow):
     def _tab_local_adjust(self) -> QWidget:
         w = QWidget(self)
         lay = QVBoxLayout(w)
-        note = QLabel("PC-local (CPU) adjustments applied to decoded frames "
-                      "BEFORE preview and virtual cam. Not part of the phone filter state.")
+        note = QLabel("PC-only (after decode). Phone filters are shared.")
         note.setWordWrap(True)
         lay.addWidget(note)
 
@@ -531,17 +544,37 @@ class MainWindow(QMainWindow):
         self._torch_check.setEnabled(camera_id == "back")
         if camera_id == "front":
             self._torch_check.setChecked(False)
+        self._apply_camera_caps()
 
     def _on_torch(self, on: bool) -> None:
+        if self._syncing_session:
+            return
         self._app.set_torch(on)
 
+    def _on_zoom(self, value: float) -> None:
+        if self._syncing_session:
+            return
+        self._app.set_zoom(float(value))
+
     def _on_abr_toggled(self, auto: bool) -> None:
-        if not self._app.streaming:
+        if self._syncing_session:
             return
         if auto:
             self._app.set_abr(True)
         else:
             self._app.set_bitrate(BITRATES_KBPS[self._kbps_combo.currentIndex()])
+
+    def _on_session_controls_changed(self, *_: Any) -> None:
+        """Push encode size/fps/bitrate immediately (not only on Start Stream)."""
+        if self._syncing_session:
+            return
+        idx = self._res_combo.currentIndex()
+        if idx < 0 or idx >= len(RESOLUTIONS):
+            return
+        w, h = RESOLUTIONS[idx]
+        fps = FPSES[max(0, self._fps_combo.currentIndex())]
+        kbps = BITRATES_KBPS[max(0, self._kbps_combo.currentIndex())]
+        self._app.push_session({"w": w, "h": h, "fps": fps, "kbps": kbps})
 
     # ------------------------------------------------------------------
     # virtual cam tab
@@ -694,9 +727,13 @@ class MainWindow(QMainWindow):
                 dev = payload.get("device", "?")
                 ios = payload.get("ios", "?")
                 camera = str(payload.get("camera", "back"))
-                self._cam_label.setText(f"camera: {camera}")
-                self._torch_check.setEnabled(camera == "back")
-                self._apply_camera_caps()
+                sess = payload.get("session")
+                if isinstance(sess, dict):
+                    self._sync_session_widgets(sess)
+                else:
+                    self._cam_label.setText(f"camera: {camera}")
+                    self._torch_check.setEnabled(camera == "back")
+                    self._apply_camera_caps()
                 self._set_status(f"welcome from {dev} (iOS {ios})")
                 self._btn_start.setEnabled(True)
             elif kind == "started":
@@ -719,6 +756,10 @@ class MainWindow(QMainWindow):
                     self._set_status("stream stopped")
                 else:
                     self._set_status("stream stopped by phone")
+            elif kind == "session":
+                state = payload.get("state")
+                if isinstance(state, dict):
+                    self._sync_session_widgets(state)
             elif kind == "camera_ok":
                 self._cam_label.setText(f"camera: {payload.get('id')}")
                 self._set_status(f"camera switched to {payload.get('id')}")
@@ -748,36 +789,87 @@ class MainWindow(QMainWindow):
         """Expose control-channel state for button enabling."""
         return "connected" in self._app.connection_text or self._app.streaming
 
+    def _sync_session_widgets(self, state: Dict[str, Any]) -> None:
+        """Apply a phone session to combos/checkboxes without echoing push_session."""
+        self._syncing_session = True
+        widgets = (self._res_combo, self._fps_combo, self._kbps_combo,
+                   self._abr_check, self._torch_check, self._zoom_spin)
+        for w in widgets:
+            w.blockSignals(True)
+        try:
+            if "w" in state and "h" in state:
+                pair = (int(state["w"]), int(state["h"]))
+                if pair in RESOLUTIONS:
+                    self._res_combo.setCurrentIndex(RESOLUTIONS.index(pair))
+            if "fps" in state:
+                fps = int(state["fps"])
+                if fps in FPSES:
+                    self._fps_combo.setCurrentIndex(FPSES.index(fps))
+            if "kbps" in state:
+                kbps = int(state["kbps"])
+                if kbps in BITRATES_KBPS:
+                    self._kbps_combo.setCurrentIndex(BITRATES_KBPS.index(kbps))
+                else:
+                    nearest = min(range(len(BITRATES_KBPS)),
+                                  key=lambda i: abs(BITRATES_KBPS[i] - kbps))
+                    self._kbps_combo.setCurrentIndex(nearest)
+            if "abr" in state:
+                self._abr_check.setChecked(bool(state["abr"]))
+            if "torch" in state:
+                self._torch_check.setChecked(bool(state["torch"]))
+            if "zoom" in state:
+                self._zoom_spin.setValue(float(state["zoom"]))
+            if "camera" in state:
+                cam = str(state["camera"])
+                self._cam_label.setText(f"camera: {cam}")
+                connected = self.control_connected()
+                self._torch_check.setEnabled(connected and cam == "back")
+            self._apply_camera_caps()
+        except (TypeError, ValueError):
+            log.exception("bad session state from phone (ignored)")
+        finally:
+            for w in widgets:
+                w.blockSignals(False)
+            self._syncing_session = False
+
     def _apply_camera_caps(self) -> None:
-        """Disable resolution/FPS entries the phone cannot encode
+        """Disable resolution/FPS entries the current camera cannot encode
         (from welcome max_front/max_back, PROTOCOL.md section 2.2)."""
         caps = self._app.get_camera_caps()
-        back = caps.get("back") or [1920, 1080, 60]
-        for i, (w, _h) in enumerate(RESOLUTIONS):
-            item = self._res_combo.model().item(i)
-            if item is not None:
-                item.setEnabled(w <= back[0])
-        # keep the selection valid: fall back to the highest enabled entry
-        idx = self._res_combo.currentIndex()
-        model_item = self._res_combo.model().item(idx)
-        if model_item is not None and not model_item.isEnabled():
-            for i in range(self._res_combo.count() - 1, -1, -1):
+        cam = self._app.get_camera()
+        row = caps.get(cam)
+        if not row:
+            row = [1280, 720, 30] if cam == "front" else [1920, 1080, 60]
+        was = self._syncing_session
+        self._syncing_session = True
+        try:
+            max_w = int(row[0])
+            for i, (w, _h) in enumerate(RESOLUTIONS):
                 item = self._res_combo.model().item(i)
-                if item is None or item.isEnabled():
-                    self._res_combo.setCurrentIndex(i)
-                    break
-        fps_max = int(back[2]) if len(back) > 2 else 30
-        for i, f in enumerate(FPSES):
-            item = self._fps_combo.model().item(i)
-            if item is not None:
-                item.setEnabled(f <= fps_max)
-        if self._fps_combo.currentIndex() >= 0:
-            item = self._fps_combo.model().item(self._fps_combo.currentIndex())
-            if item is not None and not item.isEnabled():
-                for i, f in enumerate(FPSES):
-                    if f <= fps_max:
-                        self._fps_combo.setCurrentIndex(i)
+                if item is not None:
+                    item.setEnabled(w <= max_w)
+            idx = self._res_combo.currentIndex()
+            model_item = self._res_combo.model().item(idx)
+            if model_item is not None and not model_item.isEnabled():
+                for i in range(self._res_combo.count() - 1, -1, -1):
+                    item = self._res_combo.model().item(i)
+                    if item is None or item.isEnabled():
+                        self._res_combo.setCurrentIndex(i)
                         break
+            fps_max = int(row[2]) if len(row) > 2 else 30
+            for i, f in enumerate(FPSES):
+                item = self._fps_combo.model().item(i)
+                if item is not None:
+                    item.setEnabled(f <= fps_max)
+            if self._fps_combo.currentIndex() >= 0:
+                item = self._fps_combo.model().item(self._fps_combo.currentIndex())
+                if item is not None and not item.isEnabled():
+                    for i, f in enumerate(FPSES):
+                        if f <= fps_max:
+                            self._fps_combo.setCurrentIndex(i)
+                            break
+        finally:
+            self._syncing_session = was
 
     def _refresh_devices(self) -> None:
         devices = self._app.get_devices()

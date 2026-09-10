@@ -17,7 +17,7 @@ extern const int OCVideoPort;    // 9921
 extern const int OCControlPort;  // 9923
 
 extern NSString * const OCMagicString;       // "OMNICAM1"
-extern NSString * const OCAppVersionString;  // "1.1.8"
+extern NSString * const OCAppVersionString;  // "1.1.9"
 
 @class OCNetManager, OCCaptureEngine, OCEncoder, OCPacker;
 
@@ -28,6 +28,7 @@ extern NSString * const OCAppVersionString;  // "1.1.8"
 - (void)netManagerStreamingStateDidChange:(OCNetManager *)manager;
 - (void)netManager:(OCNetManager *)manager activeCameraDidChange:(NSString *)cameraId;
 - (void)netManager:(OCNetManager *)manager didReceiveRemoteFilterState:(OCFilterState *)state;
+- (void)netManager:(OCNetManager *)manager didReceiveRemoteSession:(NSDictionary *)state;
 - (void)netManager:(OCNetManager *)manager didUpdateStatsFps:(double)fps
                                      kbps:(double)kbps encMs:(double)encMs
                                   lossPct:(double)lossPct nacks:(uint32_t)nacks
@@ -79,6 +80,12 @@ extern NSString * const OCAppVersionString;  // "1.1.8"
 
 /// Phone-side ABR toggle (mirrors the PC's `abr` message).
 - (void)enableAutoBitrate:(BOOL)enable;
+
+/// §2.3 shared session (camera, encode size, fps, bitrate, ABR, torch, zoom).
+- (NSDictionary *)sessionDictionary;
+- (void)pushSessionState;
+- (void)noteLocalCameraId:(NSString *)cid;
+- (void)notifyLocalResolutionHD:(BOOL)hd;
 
 /// RTP send path used by OCPacker (video/FEC → video port).
 - (void)sendVideoDatagram:(NSData *)data;

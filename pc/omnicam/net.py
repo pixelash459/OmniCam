@@ -7,10 +7,10 @@ Components
 - :class:`BeaconListener`  UDP 9920 discovery beacons (magic ``OMNICAM1``).
 - :class:`ControlClient`   TCP 9923 newline-delimited JSON with auto-reconnect;
                            every PC->phone message (hello/start/stop/camera/
-                           bitrate/abr/idr/filter/torch/zoom/rr/ping/bye) and
-                           parsing of every phone->PC message
+                           bitrate/abr/idr/filter/torch/zoom/session/rr/ping/bye)
+                           and parsing of every phone->PC message
                            (welcome/started/stopped/camera_ok/bitrate_ok/
-                           filter_ok/torch_ok/stats/pong/error).
+                           filter_ok/torch_ok/session/stats/pong/error).
 - :class:`VideoReceiver`   UDP 9921; RTP PT=96 H.264 (RFC 6184) + PT=100 FEC;
                            RFC 4585 NACK (PT=205 FMT=1) and PLI (PT=206 FMT=1)
                            feedback; frame assembly by RTP timestamp; XOR FEC
@@ -89,6 +89,50 @@ def default_filter_state() -> Dict[str, Any]:
         "lut": None,
         "overlay": {"text": "", "show_timecode": False},
     }
+
+
+SESSION_KEYS = ("camera", "w", "h", "fps", "kbps", "abr", "torch", "zoom")
+
+
+def default_session_state() -> Dict[str, Any]:
+    """Return a copy of the default shared session (PROTOCOL.md S2.3)."""
+    return {
+        "camera": "back",
+        "w": 1280,
+        "h": 720,
+        "fps": 30,
+        "kbps": 3000,
+        "abr": True,
+        "torch": False,
+        "zoom": 1.0,
+    }
+
+
+def merge_session_state(base: Optional[Dict[str, Any]], updates: Dict[str, Any]) -> Dict[str, Any]:
+    """Merge known session keys from ``updates`` into ``base``; absent keys stay."""
+    state = default_session_state()
+    if base:
+        for key in SESSION_KEYS:
+            if key in base:
+                state[key] = copy.deepcopy(base[key])
+    for key in SESSION_KEYS:
+        if key not in updates:
+            continue
+        val = updates[key]
+        try:
+            if key == "camera":
+                cam = str(val)
+                if cam in ("front", "back"):
+                    state[key] = cam
+            elif key in ("w", "h", "fps", "kbps"):
+                state[key] = int(val)
+            elif key in ("abr", "torch"):
+                state[key] = bool(val)
+            elif key == "zoom":
+                state[key] = max(1.0, min(8.0, float(val)))
+        except (TypeError, ValueError):
+            continue
+    return state
 
 
 def merge_filter_state(base: Optional[Dict[str, Any]], updates: Dict[str, Any]) -> Dict[str, Any]:
@@ -561,6 +605,10 @@ class ControlClient:
     def send_zoom(self, x: float) -> bool:
         """``zoom`` digital zoom factor 1.0..max (clamped by the phone)."""
         return self._send({"t": "zoom", "x": float(x)})
+
+    def send_session(self, state: Dict[str, Any]) -> bool:
+        """``session`` shared capture/encode state (PROTOCOL.md S2.3)."""
+        return self._send({"t": "session", "state": state})
 
     def send_rr(self, loss_pct: float, jitter_ms: float, max_seq: int, fps_decoded: float) -> bool:
         """``rr`` receiver report every 500 ms while streaming (drives ABR)."""

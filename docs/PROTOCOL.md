@@ -29,7 +29,9 @@ PC listens on `0.0.0.0:9920`, dedupes by source IP, refreshes a device list (dev
 ## 2. Control channel (TCP, phone listens on 9923)
 
 - Newline-delimited UTF-8 JSON. Max message 64 KiB. One client at a time; a new `hello` on a second connection is refused with `{"t":"error","code":"busy"}`.
-- PC connects, then immediately sends `hello`. Phone replies `welcome`. Phone is source of truth for filter state; PC may push state.
+- PC connects, then immediately sends `hello`. Phone replies `welcome`.
+- **Shared session:** camera, encode size, fps, bitrate, ABR, torch, and capture zoom are one object. Either side may change any field; the other side applies it and updates its UI. The phone is device authority (front camera cannot be 1080p; torch is back-only; zoom is clamped). Last-write-wins. Do not echo a `session` you just applied (`applyingRemote`).
+- Filters stay on `{"t":"filter"}` (already bidirectional, §5). PC **Local Adjust** is decode-side only and is **not** synced.
 
 ### 2.1 Messages PC → Phone
 
@@ -45,6 +47,7 @@ PC listens on `0.0.0.0:9920`, dedupes by source IP, refreshes a device list (dev
 {"t":"filter","state":{ ... }}         // full filter state, schema in §5
 {"t":"torch","on":true}
 {"t":"zoom","x":2.0}                   // digital zoom 1.0..max (clamped by phone)
+{"t":"session","state":{ ... }}        // §2.3 shared session; partial keys OK
 {"t":"rr","loss_pct":0.4,"jitter_ms":3,"max_seq":12345,"fps_decoded":29.7}  // every 500 ms while streaming; drives ABR
 {"t":"ping","ts":1234567890123}        // ms epoch; phone echoes unchanged
 {"t":"bye"}
@@ -66,19 +69,42 @@ working route to the PC.
 
 ```jsonc
 {"t":"welcome","ver":1,"app":"1.1.0","device":"iPhone7,1","ios":"12.5.8","camera":"back",
- "max_front":[1280,720,30],"max_back":[1920,1080,60],"filter":{ ...current state §5... }}
+ "max_front":[1280,720,30],"max_back":[1920,1080,60],
+ "session":{ ...current §2.3... },
+ "filter":{ ...current state §5... }}
 {"t":"started","ssrc_video":<u32>,"ssrc_fec":<u32>,"fec":false}
 {"t":"stopped"}
 {"t":"camera_ok","id":"front"}         // after switch completes (~150-300 ms black gap is normal on A8)
 {"t":"bitrate_ok","kbps":2500,"auto":false}
 {"t":"filter_ok"}
 {"t":"torch_ok","on":true}
+{"t":"session","state":{ ... }}        // phone-originated session change (same schema as PC→phone)
 {"t":"stats","fps":29.8,"kbps":2950,"enc_ms":9.2,"loss_pct":0.4,"nacks":12,"sent":34510}
 {"t":"pong","ts":1234567890123}
 {"t":"error","code":"busy|badmsg|nosuch"}
 ```
 
 `stats` is sent by the phone every 1 s while streaming. `enc_ms` = last frame encode time.
+
+### 2.3 Shared session schema
+
+```jsonc
+{
+ "camera":"back",     // "front" | "back"
+ "w":1280, "h":720,   // encode / capture target; front max 1280x720
+ "fps":30,
+ "kbps":3000,         // ABR ceiling when auto; live bitrate when auto=false
+ "abr":true,
+ "torch":false,       // ignored / forced off on front
+ "zoom":1.0           // capture digital zoom, not filter geometry zoom
+}
+```
+
+Absent keys = leave unchanged. Phone clamps then replies with the **full** applied `session` (unless the incoming message was itself a phone echo — never echo).
+
+If `w`/`h`/`fps`/`kbps` change **while streaming**, the phone restarts the encoder (same path as `start`) and still sends `started`. The PC updates its resolution/fps/bitrate widgets immediately from `session`, not only from Start Stream.
+
+Legacy `camera` / `bitrate` / `abr` / `torch` / `zoom` messages remain valid; they MUST also push a `session` so both UIs stay aligned.
 
 ## 3. Video transport (RTP/UDP)
 

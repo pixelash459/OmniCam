@@ -164,9 +164,11 @@ def test_hello_welcome_started_and_events(phone: FakePhone):
         cc.send_zoom(2.0)
         cc.send_filter({"look": "noir"})
         cc.send_rr(0.4, 3.0, 4321, 29.7)
+        cc.send_session({"camera": "back", "w": 1280, "h": 720, "fps": 30,
+                         "kbps": 3000, "abr": True, "torch": False, "zoom": 1.0})
         assert wait_until(lambda: {m.get("t") for m in phone.received} >= {
             "stop", "camera", "bitrate", "abr", "idr", "torch", "zoom",
-            "filter", "rr", "ping"}, timeout=3.0)
+            "filter", "rr", "ping", "session"}, timeout=3.0)
         rr = next(m for m in phone.received if m.get("t") == "rr")
         assert rr == {"t": "rr", "loss_pct": 0.4, "jitter_ms": 3.0,
                       "max_seq": 4321, "fps_decoded": 29.7}
@@ -288,5 +290,96 @@ def test_stop_stream_always_sends_stop_and_ignores_duplicate_stopped():
         assert [k for k, _ in app.drain_events() if k == "stopped"] == []
         app.stop_stream()  # idle Stop Stream still tells the phone
         assert sent == ["stop", "stop"]
+    finally:
+        app.shutdown()
+
+
+def test_apply_remote_session_updates_get_session_camera_and_stream_cfg():
+    app = OmniCamApp()
+    sent = []
+    app.control.send_session = lambda state: sent.append(dict(state)) or True
+    try:
+        snap = app.apply_remote_session({
+            "camera": "front", "w": 1280, "h": 720, "fps": 24,
+            "kbps": 2000, "abr": False, "torch": False, "zoom": 2.5,
+        })
+        assert sent == []
+        assert snap["camera"] == "front"
+        sess = app.get_session()
+        assert sess["camera"] == "front"
+        assert sess["w"] == 1280 and sess["h"] == 720
+        assert sess["fps"] == 24 and sess["kbps"] == 2000
+        assert sess["abr"] is False and sess["torch"] is False
+        assert sess["zoom"] == 2.5
+        assert app.get_camera() == "front"
+        assert app._stream_cfg == {"w": 1280, "h": 720, "fps": 24, "kbps": 2000}
+        # partial merge: absent keys unchanged
+        app.apply_remote_session({"fps": 15})
+        assert app.get_session()["camera"] == "front"
+        assert app.get_session()["fps"] == 15
+        assert app._stream_cfg["fps"] == 15
+    finally:
+        app.shutdown()
+
+
+def test_push_session_does_not_recurse_on_apply_remote():
+    app = OmniCamApp()
+    sent = []
+    app.control.send_session = lambda state: sent.append(dict(state)) or True
+    try:
+        app.apply_remote_session({"w": 1920, "h": 1080, "fps": 30, "kbps": 6000})
+        assert sent == []
+        app.push_session({"kbps": 3000})
+        assert len(sent) == 1
+        assert sent[0]["kbps"] == 3000
+        assert sent[0]["w"] == 1920
+        sent.clear()
+        app.apply_remote_session({"kbps": 1000, "abr": True})
+        assert sent == []
+        assert app.get_session()["kbps"] == 1000
+        assert app.get_session()["abr"] is True
+        # flag is held during apply_remote, so a re-entrant push is dropped
+        orig_install = app._install_session
+
+        def install_then_try_push(updates, *, update_rx):
+            snap = orig_install(updates, update_rx=update_rx)
+            app.push_session({"fps": 24})
+            return snap
+
+        app._install_session = install_then_try_push  # type: ignore[method-assign]
+        app.apply_remote_session({"fps": 15})
+        assert sent == []
+        assert app.get_session()["fps"] == 15
+    finally:
+        app.shutdown()
+
+
+def test_welcome_with_session_key_applies_and_emits():
+    app = OmniCamApp()
+    sent = []
+    app.control.send_session = lambda state: sent.append(dict(state)) or True
+    try:
+        welcome = dict(WELCOME)
+        welcome["camera"] = "back"
+        welcome["session"] = {
+            "camera": "front", "w": 1280, "h": 720, "fps": 30,
+            "kbps": 3000, "abr": True, "torch": False, "zoom": 1.5,
+        }
+        app._on_message(welcome)
+        assert sent == []
+        assert app.get_session()["zoom"] == 1.5
+        assert app.get_session()["camera"] == "front"
+        assert app.get_camera() == "front"
+        assert app._stream_cfg["w"] == 1280
+        kinds = [k for k, _ in app.drain_events()]
+        assert "welcome" in kinds
+        assert "session" in kinds
+        # inbound session message also applies and does not echo
+        app._on_message({"t": "session", "state": {"fps": 15, "kbps": 500}})
+        assert sent == []
+        assert app.get_session()["fps"] == 15
+        assert app.get_session()["kbps"] == 500
+        kinds = [k for k, _ in app.drain_events()]
+        assert kinds == ["session"]
     finally:
         app.shutdown()

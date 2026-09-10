@@ -26,7 +26,9 @@ from omnicam.net import (
     ControlClient,
     VideoReceiver,
     default_filter_state,
+    default_session_state,
     merge_filter_state,
+    merge_session_state,
 )
 from omnicam.stats import Stats
 from omnicam.virtualcam_out import VirtualCamOut
@@ -124,6 +126,8 @@ class OmniCamApp:
         self._fec_active = False
 
         self._filter_state: Dict[str, Any] = default_filter_state()
+        self._session: Dict[str, Any] = default_session_state()
+        self._applying_remote_session = False
         self._camera = "back"
         self._conn_text = "disconnected"
         self._camera_caps: Dict[str, List[int]] = {}
@@ -291,6 +295,8 @@ class OmniCamApp:
         self.stats.reset_stream()
         self.video_rx.reset()
         self._stream_cfg = {"w": int(w), "h": int(h), "fps": int(fps), "kbps": int(kbps)}
+        with self._local_lock:
+            self._session = merge_session_state(self._session, self._stream_cfg)
         self.video_rx.set_fps(int(fps))
         with self._vdec_lock:
             old, self._vdec = self._vdec, VideoDecoder()
@@ -329,23 +335,81 @@ class OmniCamApp:
         if was:
             self._emit("stopped", {"local": True})
 
+    def get_session(self) -> Dict[str, Any]:
+        """Copy of the last known shared session (PROTOCOL.md S2.3)."""
+        with self._local_lock:
+            return copy.deepcopy(self._session)
+
+    def apply_remote_session(self, state: Dict[str, Any]) -> Dict[str, Any]:
+        """Install session state from the phone (welcome / ``session`` / legacy ok).
+
+        Never sends ``session`` back (phone already applied; no echo).
+        """
+        self._applying_remote_session = True
+        try:
+            return self._install_session(state, update_rx=True)
+        finally:
+            self._applying_remote_session = False
+
+    def push_session(self, updates: Dict[str, Any]) -> Dict[str, Any]:
+        """Merge ``updates`` locally and send ``{"t":"session","state":...}``.
+
+        Skipped while applying a remote session so combo/UI handlers cannot echo.
+        """
+        if self._applying_remote_session:
+            return self.get_session()
+        snap = self._install_session(updates, update_rx=True)
+        self.control.send_session(snap)
+        return snap
+
+    def _install_session(self, updates: Dict[str, Any], *, update_rx: bool) -> Dict[str, Any]:
+        with self._local_lock:
+            old_w = int(self._session.get("w", 1280))
+            old_h = int(self._session.get("h", 720))
+            old_fps = int(self._session.get("fps", 30))
+            self._session = merge_session_state(self._session, updates)
+            self._camera = str(self._session.get("camera", self._camera))
+            self._stream_cfg = {
+                "w": int(self._session["w"]),
+                "h": int(self._session["h"]),
+                "fps": int(self._session["fps"]),
+                "kbps": int(self._session["kbps"]),
+            }
+            snap = copy.deepcopy(self._session)
+        size_fps_changed = (
+            int(snap["w"]) != old_w or int(snap["h"]) != old_h or int(snap["fps"]) != old_fps
+        )
+        if update_rx and self._streaming and size_fps_changed:
+            self.video_rx.set_fps(int(snap["fps"]))
+        return snap
+
     def set_camera(self, camera_id: str) -> None:
         """Switch the phone camera ('front' or 'back')."""
-        if camera_id in ("front", "back"):
-            self._camera = camera_id
-            self.control.send_camera(camera_id)
+        if camera_id not in ("front", "back"):
+            return
+        self._camera = camera_id
+        self.control.send_camera(camera_id)
+        self.push_session({"camera": camera_id})
 
     def set_torch(self, on: bool) -> None:
         """Toggle the phone torch."""
         self.control.send_torch(on)
+        self.push_session({"torch": bool(on)})
+
+    def set_zoom(self, x: float) -> None:
+        """Capture digital zoom (1.0..8.0, clamped by the phone)."""
+        self.control.send_zoom(float(x))
+        self.push_session({"zoom": float(x)})
 
     def set_bitrate(self, kbps: int) -> None:
         """Manual bitrate override (disables phone-side ABR)."""
         self.control.send_bitrate(int(kbps))
+        self.push_session({"kbps": int(kbps), "abr": False})
 
     def set_abr(self, auto: bool) -> None:
         """Enable/disable phone-side adaptive bitrate."""
         self.control.send_abr(bool(auto))
+        self.push_session({"abr": bool(auto)})
 
     def request_idr(self) -> None:
         """Force a keyframe on the phone."""
@@ -424,7 +488,16 @@ class OmniCamApp:
                                          "back": [int(v) for v in back[:3]]}
                 except (TypeError, ValueError):
                     self._camera_caps = {}
+            sess = msg.get("session")
+            if isinstance(sess, dict):
+                self.apply_remote_session(sess)
+                self._emit("session", {"state": self.get_session()})
             self._emit("welcome", dict(msg))
+        elif kind == "session":
+            state = msg.get("state")
+            if isinstance(state, dict):
+                self.apply_remote_session(state)
+                self._emit("session", {"state": self.get_session()})
         elif kind == "started":
             self._apply_started(msg)
         elif kind == "stopped":
@@ -437,13 +510,29 @@ class OmniCamApp:
                 self._teardown_stream()
                 self._emit("stopped", {})
         elif kind == "camera_ok":
-            self._camera = str(msg.get("id", self._camera))
+            cam = str(msg.get("id", self._camera))
+            self._camera = cam
+            self.apply_remote_session({"camera": cam})
+            self._emit("session", {"state": self.get_session()})
             self._emit("camera_ok", dict(msg))
         elif kind == "bitrate_ok":
+            patch: Dict[str, Any] = {}
+            if "kbps" in msg:
+                try:
+                    patch["kbps"] = int(msg["kbps"])
+                except (TypeError, ValueError):
+                    pass
+            if "auto" in msg:
+                patch["abr"] = bool(msg.get("auto"))
+            if patch:
+                self.apply_remote_session(patch)
+                self._emit("session", {"state": self.get_session()})
             self._emit("bitrate_ok", dict(msg))
         elif kind == "filter_ok":
             self._emit("filter_ok", {})
         elif kind == "torch_ok":
+            self.apply_remote_session({"torch": bool(msg.get("on"))})
+            self._emit("session", {"state": self.get_session()})
             self._emit("torch_ok", dict(msg))
         elif kind == "stats":
             self.stats.set_phone(msg)
