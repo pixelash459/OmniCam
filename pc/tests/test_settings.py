@@ -93,11 +93,11 @@ def test_prefs_roundtrip(sdir):
 
 
 def test_remember_phone_upsert_order_and_cap(sdir):
-    settings.remember_phone("192.168.0.152", name="iPhone7,1", device="12.5.8")
+    settings.remember_phone("10.0.0.50", name="iPhone7,1", device="12.5.8")
     time.sleep(0.01)
     settings.remember_phone("192.168.0.77", name="iPad")
     phones = settings.known_phones()
-    assert [p["ip"] for p in phones] == ["192.168.0.77", "192.168.0.152"]
+    assert [p["ip"] for p in phones] == ["192.168.0.77", "10.0.0.50"]
     assert phones[1]["name"] == "iPhone7,1"
     assert phones[1]["device"] == "12.5.8"
     assert isinstance(phones[0]["last_seen"], float)
@@ -105,16 +105,16 @@ def test_remember_phone_upsert_order_and_cap(sdir):
 
     # upsert: bumps to front, empty name/device do not clobber stored values
     time.sleep(0.01)
-    settings.remember_phone("192.168.0.152")
+    settings.remember_phone("10.0.0.50")
     phones = settings.known_phones()
-    assert phones[0]["ip"] == "192.168.0.152"
+    assert phones[0]["ip"] == "10.0.0.50"
     assert phones[0]["name"] == "iPhone7,1"
     assert phones[0]["device"] == "12.5.8"
     assert len(phones) == 2
 
     # non-empty values overwrite
-    settings.remember_phone("192.168.0.152", name="Ash's iPhone")
-    assert settings.known_phones()[0]["name"] == "Ash's iPhone"
+    settings.remember_phone("10.0.0.50", name="Front iPhone")
+    assert settings.known_phones()[0]["name"] == "Front iPhone"
 
     # blank ip ignored
     settings.remember_phone("   ")
@@ -175,14 +175,14 @@ def test_app_remembers_phone_on_welcome_and_beacon(sdir):
 
     app = OmniCamApp()
     try:
-        app.control._target = ("192.168.0.152", 9923)
+        app.control._target = ("10.0.0.50", 9923)
         app._on_message({"t": "welcome", "ver": 1, "app": "1.1.0", "device": "iPhone7,1",
                          "ios": "12.5.8", "camera": "back"})
         phones = app.known_phones()
-        assert phones[0]["ip"] == "192.168.0.152"
+        assert phones[0]["ip"] == "10.0.0.50"
         assert phones[0]["name"] == "iPhone7,1"
         assert phones[0]["device"] == "12.5.8"
-        assert settings.get_pref("last_ip") == "192.168.0.152"
+        assert settings.get_pref("last_ip") == "10.0.0.50"
 
         app.beacons._handle_beacon(
             json.dumps({"magic": "OMNICAM1", "name": "QA iPhone", "model": "iPhone15,3",
@@ -211,12 +211,12 @@ def test_autoconnect_last(sdir):
         assert app.autoconnect_last() is None  # nothing remembered
         settings.remember_phone("192.168.0.5", name="old")
         time.sleep(0.01)
-        settings.remember_phone("192.168.0.152", name="new")
+        settings.remember_phone("10.0.0.50", name="new")
         settings.set_pref("autoconnect", False)
         assert app.autoconnect_last() is None
         settings.set_pref("autoconnect", True)
-        assert app.autoconnect_last() == "192.168.0.152"
-        assert calls == ["192.168.0.152"]
-        assert any(d["ip"] == "192.168.0.152" for d in app.get_devices())
+        assert app.autoconnect_last() == "10.0.0.50"
+        assert calls == ["10.0.0.50"]
+        assert any(d["ip"] == "10.0.0.50" for d in app.get_devices())
     finally:
         app.shutdown()

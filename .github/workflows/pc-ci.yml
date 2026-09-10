@@ -1,0 +1,84 @@
+name: PC client CI
+
+# Runs the Windows receiver's test suite on every push / pull request and
+# builds the PyInstaller + Inno Setup installer as a downloadable artifact.
+#
+# Release binaries (OmniCam.ipa and OmniCam-PC-<ver>-Setup.exe) are built and
+# tested on real hardware by the maintainer and uploaded to GitHub Releases by
+# hand; this workflow deliberately does not touch releases.
+
+on:
+  push:
+    branches: ["**"]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install dependencies
+        working-directory: pc
+        run: |
+          python -m pip install -U pip
+          python -m pip install -r requirements.txt pytest
+
+      - name: Run tests (offscreen Qt)
+        working-directory: pc
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: python -m pytest tests -q
+
+  installer:
+    runs-on: windows-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install dependencies
+        working-directory: pc
+        run: |
+          python -m pip install -U pip
+          python -m pip install -r requirements.txt -r requirements-build.txt
+
+      - name: Build icon
+        working-directory: pc
+        run: python packaging/make_icon.py
+
+      - name: PyInstaller onedir
+        working-directory: pc
+        run: pyinstaller --noconfirm --clean OmniCam.spec
+
+      - name: Install Inno Setup
+        run: choco install innosetup --no-progress -y
+
+      - name: Compile installer
+        working-directory: pc
+        shell: pwsh
+        run: |
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) { $iscc = "$env:ProgramFiles\Inno Setup 6\ISCC.exe" }
+          if (-not (Test-Path $iscc)) { throw "ISCC.exe not found" }
+          & $iscc packaging\OmniCam.iss
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Upload installer artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: OmniCam-PC-Setup
+          path: dist/OmniCam-PC-*-Setup.exe
+          if-no-files-found: error

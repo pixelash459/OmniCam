@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # build-wsl.sh — primary build path: Theos inside WSL, fully offline from Apple.
 #
-# Windows usage (from the repo root, e.g. E:\Vibe ios apps\OmniCam):
+# Windows usage (from the repo root):
 #
 #     wsl bash scripts/build-wsl.sh
 #

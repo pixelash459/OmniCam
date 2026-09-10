@@ -28,6 +28,13 @@ scripts/*.ips
 Thumbs.db
 desktop.ini
 
+# --- Local / machine-only scripts (not for the public tree) ---
+scripts/live_diagnose.py
+scripts/wsl-inspect.sh
+
+# --- Logs ---
+*.log
+
 # --- Editors ---
 .vscode/
 .idea/

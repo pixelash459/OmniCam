@@ -14,7 +14,7 @@ One-time setup (PowerShell, admin not required):
 wsl --install -d Ubuntu     # once; reboot when asked, create a UNIX user
 ```
 
-Then, from the repo root (`E:\Vibe ios apps\OmniCam`) in Windows Terminal:
+Then, from the **repo root** in Windows Terminal (PowerShell or cmd):
 
 ```bash
 wsl bash scripts/build-wsl.sh
@@ -24,7 +24,7 @@ What the script does:
 
 1. Installs **Theos** if missing — fully user-space in `~/theos`, **no sudo / apt needed**: theos core + Procursus `ldid` static binary + the official Theos-for-Linux cross-clang (`L1ghtmann/llvm-project` iOSToolchain) + the `iPhoneOS12.4` SDK from `theos/sdks`. First run downloads ~1 GB once.
 2. Builds with `make package FINALPACKAGE=1` from `ios/` — `TARGET = iphone:clang:12.4:12.0`, `ARCHS = arm64`, `THEOS_PACKAGE_FORMAT = ipa`. Theos **fake-signs the binary with `ldid -S` automatically**.
-3. Copies the result to **`dist/OmniCam.ipa`** (the versioned original stays in `ios/packages/local.omnicam.app_1.1.0.ipa`).
+3. Copies the result to **`dist/OmniCam.ipa`** (a versioned copy is also written next to it).
 
 Output artifact: `dist/OmniCam.ipa`.
 
@@ -32,10 +32,10 @@ Output artifact: `dist/OmniCam.ipa`.
 
 Requires the repo to be on GitHub.
 
-1. Push the repo to GitHub (`main`, or any tag).
-2. Actions tab → **Build unsigned IPA** → *Run workflow* (or just push a tag — it triggers on `workflow_dispatch` and tag pushes).
-3. Wait for the green run (`macos-14` + **Xcode 15.4** — the last Xcode able to target iOS 12 — + `xcodegen` + `ldid`), then download the artifact **`OmniCam-unsigned.ipa`** from the run summary page.
-4. **Version tags** (`v1.1.3`, …) also attach **`OmniCam.ipa`** and **`OmniCam-PC-*-Setup.exe`** to the [Releases page](https://github.com/pixelash459/OmniCam/releases).
+1. Push the repo to GitHub.
+2. Actions tab → **Build unsigned IPA** → **Run workflow** (`workflow_dispatch` only — tags do not auto-build an IPA).
+3. Wait for the run (`macos-14` + **Xcode 15.4**, the last Xcode that can target iOS 12, + `xcodegen` + `ldid`), then download the artifact **`OmniCam-unsigned.ipa`**.
+4. Official **Releases** (`OmniCam.ipa` + `OmniCam-PC-*-Setup.exe`) are built and uploaded by the maintainer after device testing. Windows CI (`pc-ci.yml`) runs tests and can attach an installer **artifact**, not the Release.
 
 The recipe is exactly: `xcodegen generate` → `xcodebuild ... CODE_SIGNING_ALLOWED=NO CODE_SIGN_IDENTITY="" ARCHS=arm64 IPHONEOS_DEPLOYMENT_TARGET=12.0` → assemble `Payload/OmniCam.app` → `ldid -S` main binary + any embedded frameworks → `zip -r OmniCam.ipa Payload`.
 
@@ -47,7 +47,7 @@ The recipe is exactly: `xcodegen generate` → `xcodebuild ... CODE_SIGNING_ALLO
 
 > **Skip the build:** a freshly compiled and verified `OmniCam.ipa` already ships in
 > `dist/` of this repository — produced by the WSL+Theos pipeline (arm64, min iOS 12.0,
-> `ldid -S` fake-signed, video-only v1.1.0). Jump straight to step (b) below.
+> `ldid -S` fake-signed). Or download the matching tag from Releases. Jump to (b).
 
 Because **AppSync Unified** is installed, ipas install permanently: **no developer-mode trust prompt, no 7-day expiry**.
 
@@ -84,7 +84,7 @@ Both work the same way as Filza once AppSync is present; the file just travels o
 ## (d) First-run walkthrough
 
 1. **Phone**: re-jailbreak if you rebooted (Safari → `jbme.h4ck.kr`), open **OmniCam**, tap **Allow** on the camera prompt. Leave it open in the foreground.
-2. **PC**: open **OmniCam PC** (the Python client in `pc/`). The phone appears in the device list within a second or two (UDP beacon, port 9920). If it doesn't, enter the phone's IP manually.
+2. **PC**: open **OmniCam PC**. The phone appears in the device list (UDP beacon, port 9920). If it doesn't, enter the phone's IP and Connect. Saved phones persist across launches.
 3. Click **Connect**, then **Start Stream**. The preview window shows the phone camera (720p30 H.264 over RTP/UDP — glass-to-glass ≈ 60–110 ms).
 4. Use OmniCam as a webcam in any app: select **OBS Virtual Camera** as the camera device (OmniCam PC feeds it via `pyvirtualcam`):
    - **Zoom**: Settings → Video → Camera → *OBS Virtual Camera*.
@@ -105,7 +105,7 @@ Tip: `.cube` LUTs can be sent to the phone by any file route (Filza upload, iTun
 | "Unable to install" in Filza | Corrupt download, or a simulator/armv7 ipa | Re-upload the ipa; confirm it contains `Payload/OmniCam.app` with an `arm64` binary (unzip and check `lipo -info` on PC) |
 | OmniCam icon never appears | AppSync Unified missing/disabled | Sileo → check **AppSync Unified** is installed, reinstall the ipa |
 | Filza web page won't load from PC | Web server off, wrong IP, or router client isolation | Toggle Filza's web server; verify the IP in Settings → Wi-Fi; ping the phone; use the USB route instead |
-| PC doesn't see the phone in OmniCam PC | AP isolation, or firewall blocking UDP 9920 | Enter the phone IP manually; allow UDP 9920–9921 + TCP 9923 through Windows Firewall |
+| PC doesn't see the phone in OmniCam PC | AP isolation, or Windows Firewall (Wi-Fi often **Public**) | Reinstall PC 1.2.0+ (rule uses `profile=any`); or allow inbound UDP 9920–9921 for OmniCam.exe; typing the IP always works |
 | Connects but no video | Router blocks UDP or heavy loss | OmniCam's NACK/FEC handles moderate loss; check PC firewall for inbound UDP 9921 |
 | No "OBS Virtual Camera" in Zoom/Teams | OmniCam PC not running, or app started before the virtual cam | Start OmniCam PC first, restart the meeting app afterwards |
 | App runs in a small letterboxed window | Launch storyboard not picked up (rare, Theos builds only; iOS caches launch screens) | Reboot the phone once (then re-jailbreak); if it persists, install the GitHub-Actions-built ipa, whose launch storyboard is ibtool-compiled |
@@ -123,6 +123,7 @@ Tip: `.cube` LUTs can be sent to the phone by any file route (Filza upload, iTun
 | `ios/Resources/Info.plist` | The single shared Info.plist (bundle id `local.omnicam.app`, camera usage string, `.cube` document type). Used by BOTH Theos and XcodeGen |
 | `ios/Resources/LaunchScreen.storyboard` | Minimal blank black launch screen |
 | `project.yml` | XcodeGen spec for the backup Xcode/CI build (rewrites `ios/Resources/Info.plist` deterministically on `xcodegen generate`) |
-| `.github/workflows/build-ipa.yml` | macos-14 + Xcode 15.4 unsigned-ipa CI (backup path) |
+| `.github/workflows/build-ipa.yml` | macos-14 + Xcode 15.4 unsigned-ipa CI (**manual** backup) |
+| `.github/workflows/pc-ci.yml` | Windows pytest + installer artifact |
 | `scripts/fakesign.sh` | Re-`ldid -S` any .ipa/.app and re-zip |
 | `scripts/build-wsl.sh` | One-command Theos build in WSL → `dist/OmniCam.ipa` |

@@ -10,6 +10,9 @@
 name: OmniCam
 options:
   createIntermediateGroups: true
+  # Pin the .xcodeproj format to what Xcode 15.4 can open (newer XcodeGen
+  # defaults to a project format Xcode 15 rejects with "future format (77)").
+  xcodeVersion: "15.4"
   deploymentTarget:
     iOS: "12.0"
 

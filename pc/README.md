@@ -93,8 +93,8 @@ TCP 9923, so inbound UDP must be allowed. To add the rules manually
 (administrator Command Prompt):
 
 ```bat
-netsh advfirewall firewall add rule name="OmniCam PC UDP In" dir=in action=allow protocol=UDP localport=9920-9921 profile=private
-netsh advfirewall firewall add rule name="OmniCam PC TCP Out" dir=out action=allow protocol=TCP localport=9923 profile=private
+netsh advfirewall firewall add rule name="OmniCam PC UDP In" dir=in action=allow protocol=UDP localport=9920-9921 profile=any
+netsh advfirewall firewall add rule name="OmniCam PC TCP Out" dir=out action=allow protocol=TCP localport=9923 profile=any
 ```
 
 ## 5. Run
@@ -115,10 +115,14 @@ run.bat
 
 ## Troubleshooting
 
-- **No device found** - the access point likely blocks broadcast/AP isolation
-  (common on guest Wi-Fi and phone hotspots). Type the iPhone's IP manually
-  (Settings -> Wi-Fi -> (i)) and Connect. Make sure both devices are on the
-  same network and the phone app is in the foreground.
+- **No device found** — guest Wi-Fi / AP isolation blocks broadcast, **or**
+  Windows classified the LAN as **Public** and blocked UDP 9920. Type the
+  iPhone IP (Settings → Wi-Fi → ⓘ) and Connect. Reinstall 1.2.0+ so the
+  firewall rule uses `profile=any`. Phone app must be in the foreground.
+- **Colours swapped in Zoom/Teams (blue skin)** — fixed in 1.2.1 (BGR vs RGB
+  into OBS). Update the PC app.
+- **Closing X does not quit** — the app hides to the tray. Right-click the
+  tray icon → Quit OmniCam, or use the status-bar Quit button.
 - **Connect fails / keeps retrying** - check firewall rules above, verify the
   phone shows OmniCam running; only one PC client at a time (a second
   connection gets `{"t":"error","code":"busy"}`).
@@ -151,7 +155,9 @@ pc\
     stats.py            fps/bitrate/loss/RTT/glass-to-glass estimation
     app.py              orchestration + decode threads
     ui.py               PySide6 dark UI
-  tests\                55-test suite (unit + simulated-phone end-to-end)
+  tests\                pytest suite (protocol, UI smoke, tray, settings)
+  OmniCam.spec          PyInstaller onedir spec
+  build-exe.bat         icon + freeze + Inno Setup
 ```
 
 Tests: `.venv\Scripts\python -m pytest tests\ -q` (needs `pytest`,
