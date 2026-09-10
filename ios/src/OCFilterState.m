@@ -186,9 +186,42 @@ static NSString *ocOneOf(NSDictionary *d, NSString *key, NSString *def, NSArray<
     [[NSNotificationCenter defaultCenter] postNotificationName:OCFilterStateDidChangeNotification object:self];
 }
 
+// NSUserDefaults only accepts property-list objects. The protocol dictionary
+// carries "lut": null (JSON null) when no LUT is selected — writing that NSNull
+// raised NSInvalidArgumentException on every slider change and killed the app.
+static id ocPlistSafe(id obj) {
+    if (obj == nil || obj == NSNull.null) return nil;
+    if ([obj isKindOfClass:[NSDictionary class]]) {
+        NSMutableDictionary *out = [NSMutableDictionary dictionaryWithCapacity:[obj count]];
+        [(NSDictionary *)obj enumerateKeysAndObjectsUsingBlock:^(id key, id val, BOOL *stop) {
+            id safe = ocPlistSafe(val);
+            if (safe && [key isKindOfClass:[NSString class]]) out[key] = safe;
+        }];
+        return out;
+    }
+    if ([obj isKindOfClass:[NSArray class]]) {
+        NSMutableArray *out = [NSMutableArray arrayWithCapacity:[obj count]];
+        for (id v in (NSArray *)obj) {
+            id safe = ocPlistSafe(v);
+            if (safe) [out addObject:safe];
+        }
+        return out;
+    }
+    if ([obj isKindOfClass:[NSString class]] || [obj isKindOfClass:[NSNumber class]] ||
+        [obj isKindOfClass:[NSData class]] || [obj isKindOfClass:[NSDate class]]) {
+        return obj;
+    }
+    return [obj description];
+}
+
 - (void)saveToDefaults {
-    [[NSUserDefaults standardUserDefaults] setObject:[self dictionaryRepresentation]
-                                              forKey:OCFilterStateDefaultsKey];
+    id plist = ocPlistSafe([self dictionaryRepresentation]);
+    if (!plist) return;
+    @try {
+        [[NSUserDefaults standardUserDefaults] setObject:plist forKey:OCFilterStateDefaultsKey];
+    } @catch (NSException *ex) {
+        NSLog(@"[OmniCam] filter state save failed: %@", ex);
+    }
 }
 
 #pragma mark Validation

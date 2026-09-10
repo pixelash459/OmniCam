@@ -13,6 +13,7 @@
 #import <sys/socket.h>
 #import <sys/sysctl.h>
 #import <ifaddrs.h>
+#import <net/if.h>
 #import <unistd.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -24,7 +25,7 @@ const int OCVideoPort   = 9921;
 const int OCControlPort = 9923;
 
 NSString * const OCMagicString      = @"OMNICAM1";
-NSString * const OCAppVersionString = @"1.1.12";
+NSString * const OCAppVersionString = @"1.2.0";
 
 static const NSUInteger OCMaxLineBytes = 64 * 1024; // §2 max message 64 KiB
 static const double OCAbrFloorKbps = 500.0;         // §6
@@ -83,6 +84,7 @@ static NSString *ocDeviceModel(void) {
 @property (nonatomic, strong, nullable) dispatch_source_t listenSource;
 @property (nonatomic, strong, nullable) dispatch_source_t clientSource;
 @property (nonatomic, strong, nullable) dispatch_source_t beaconTimer;
+@property (nonatomic, strong, nullable) dispatch_source_t beaconProbeSource;
 @property (nonatomic, strong, nullable) dispatch_source_t statsTimer;
 @property (nonatomic, strong, nullable) NSMutableData *lineBuf;
 @property (nonatomic, copy, nullable) NSString *clientName;
@@ -134,6 +136,7 @@ static NSString *ocDeviceModel(void) {
     dispatch_source_cancel(_listenSource);
     dispatch_source_cancel(_clientSource);
     dispatch_source_cancel(_beaconTimer);
+    if (_beaconProbeSource) dispatch_source_cancel(_beaconProbeSource);
     dispatch_source_cancel(_statsTimer);
 }
 
@@ -191,6 +194,8 @@ static NSString *ocDeviceModel(void) {
     });
     dispatch_async(_beaconQueue, ^{
         dispatch_source_cancel(self->_beaconTimer);
+        if (self->_beaconProbeSource) dispatch_source_cancel(self->_beaconProbeSource);
+        self->_beaconProbeSource = nil;
         if (self->_beaconSock != -1) {
             close(self->_beaconSock);
             self->_beaconSock = -1;
@@ -287,12 +292,57 @@ static NSString *ocDeviceModel(void) {
 
 #pragma mark Beacon (§1)
 
+// Subnet-directed broadcast of the Wi-Fi interface (e.g. 192.168.0.255).
+// Many APs/routers and multi-adapter Windows hosts drop the limited broadcast
+// 255.255.255.255 but deliver the directed one, so the beacon goes to both.
+static BOOL ocWifiBroadcast(struct in_addr *out) {
+    struct ifaddrs *addrs = NULL;
+    if (getifaddrs(&addrs) != 0) return NO;
+    BOOL found = NO;
+    for (struct ifaddrs *ifa = addrs; ifa && !found; ifa = ifa->ifa_next) {
+        if (!ifa->ifa_addr || ifa->ifa_addr->sa_family != AF_INET) continue;
+        if (!(ifa->ifa_flags & IFF_UP) || (ifa->ifa_flags & IFF_LOOPBACK)) continue;
+        if (!(ifa->ifa_flags & IFF_BROADCAST) || !ifa->ifa_dstaddr) continue;
+        if (strncmp(ifa->ifa_name, "en", 2) != 0) continue; // en0 = Wi-Fi
+        *out = ((struct sockaddr_in *)ifa->ifa_dstaddr)->sin_addr;
+        found = YES;
+    }
+    freeifaddrs(addrs);
+    return found;
+}
+
+- (NSData *)beaconLine {
+    NSDictionary *json = @{
+        @"magic": OCMagicString,
+        @"ver": @1,
+        @"name": [[UIDevice currentDevice] name] ?: @"iPhone",
+        @"model": _deviceModel,
+        @"tcp_port": @(OCControlPort),
+        @"streaming": @(_streaming),
+        @"app": OCAppVersionString,
+    };
+    return [self jsonLine:json];
+}
+
 - (void)setupBeacon {
     dispatch_async(_beaconQueue, ^{
         int s = socket(AF_INET, SOCK_DGRAM, 0);
         if (s < 0) return;
         int on = 1;
         setsockopt(s, SOL_SOCKET, SO_BROADCAST, &on, sizeof on);
+        setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &on, sizeof on);
+        // Bind to 9920 as well: a PC whose network filters broadcasts can send a
+        // unicast/directed probe here and gets the beacon back unicast (§1).
+        struct sockaddr_in local;
+        memset(&local, 0, sizeof local);
+        local.sin_family = AF_INET;
+        local.sin_port = htons(OCBeaconPort);
+        local.sin_addr.s_addr = htonl(INADDR_ANY);
+        if (bind(s, (struct sockaddr *)&local, sizeof local) != 0) {
+            NSLog(@"[OmniCam] beacon bind :%d failed (%s) — probes disabled", OCBeaconPort, strerror(errno));
+        }
+        int flags = fcntl(s, F_GETFL, 0);
+        if (flags >= 0) fcntl(s, F_SETFL, flags | O_NONBLOCK);
         self->_beaconSock = s;
 
         struct sockaddr_in dest;
@@ -301,29 +351,51 @@ static NSString *ocDeviceModel(void) {
         dest.sin_port = htons(OCBeaconPort);
         dest.sin_addr.s_addr = inet_addr("255.255.255.255");
 
+        __weak typeof(self) wself = self; // break timer→handler→self cycle
         dispatch_source_t t = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, _beaconQueue);
         dispatch_source_set_timer(t, DISPATCH_TIME_NOW, 1.0 * NSEC_PER_SEC, 100 * NSEC_PER_MSEC);
-        __weak typeof(self) wself = self; // break timer→handler→self cycle
         dispatch_source_set_event_handler(t, ^{
             __strong typeof(self) sself = wself;
-            if (!sself) return;
-            NSDictionary *json = @{
-                @"magic": OCMagicString,
-                @"ver": @1,
-                @"name": [[UIDevice currentDevice] name] ?: @"iPhone",
-                @"model": sself->_deviceModel,
-                @"tcp_port": @(OCControlPort),
-                @"streaming": @(sself->_streaming),
-                @"app": OCAppVersionString,
-            };
-            NSData *line = [sself jsonLine:json];
-            if (line && sself->_beaconSock != -1) {
+            if (!sself || sself->_beaconSock == -1) return;
+            NSData *line = [sself beaconLine];
+            if (!line) return;
+            sendto(sself->_beaconSock, line.bytes, line.length, 0,
+                   (struct sockaddr *)&dest, sizeof dest);
+            struct in_addr bcast;
+            if (ocWifiBroadcast(&bcast) && bcast.s_addr != dest.sin_addr.s_addr) {
+                struct sockaddr_in d2 = dest;
+                d2.sin_addr = bcast;
                 sendto(sself->_beaconSock, line.bytes, line.length, 0,
-                       (struct sockaddr *)&dest, sizeof dest);
+                       (struct sockaddr *)&d2, sizeof d2);
             }
         });
         self->_beaconTimer = t;
         dispatch_resume(t);
+
+        // Probe responder: anything that arrives on 9920 gets a unicast beacon.
+        int fd = s;
+        dispatch_source_t rd = dispatch_source_create(DISPATCH_SOURCE_TYPE_READ, (uintptr_t)fd, 0, _beaconQueue);
+        dispatch_source_set_event_handler(rd, ^{
+            __strong typeof(self) sself = wself;
+            if (!sself) return;
+            uint8_t buf[1500];
+            struct sockaddr_in from;
+            socklen_t flen = sizeof from;
+            for (int i = 0; i < 8; i++) {
+                ssize_t n = recvfrom(fd, buf, sizeof buf, 0, (struct sockaddr *)&from, &flen);
+                if (n <= 0) break;
+                // Only answer PC probes ({"magic":"OMNICAM1","t":"probe"});
+                // ignore our own beacons echoed back by the stack.
+                if (!memmem(buf, (size_t)n, "probe", 5)) continue;
+                NSData *line = [sself beaconLine];
+                if (line) {
+                    sendto(fd, line.bytes, line.length, 0, (struct sockaddr *)&from, flen);
+                }
+            }
+        });
+        dispatch_source_set_cancel_handler(rd, ^{});
+        self->_beaconProbeSource = rd;
+        dispatch_resume(rd);
     });
 }
 

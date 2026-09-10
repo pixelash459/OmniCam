@@ -1,13 +1,16 @@
 """PySide6 user interface for OmniCam PC.
 
-Layout: LEFT devices + stream controls; CENTER video preview (30 fps QTimer,
-latest-frame only); RIGHT tabs (Virtual Cam / Local Adjust / Phone Filters /
-Stats); status bar with connection state, RTT and version.
+Layout: a scrollable LEFT sidebar of cards (Connection, Saved phones, Stream,
+Camera, Phone Filters, Local Adjust, Virtual Camera); the video preview in the
+CENTRE (30 fps QTimer, latest frame only) with a slim stats strip beneath it
+and an expandable detail grid; a status line at the bottom.
 
 Phone Filters mirrors PROTOCOL.md section 5: any change is pushed to the
 phone automatically via ``{"t":"filter","state":...}`` and incoming phone-side
-changes update the controls (bidirectional sync; full fine-tuning lives on
-the phone UI).
+changes update the controls (bidirectional sync).  Local Adjust is PC-only.
+
+Saved phones / preferences use ``omnicam.settings`` when available; the import
+is defensive so the window works without that module (feature disabled).
 """
 
 from __future__ import annotations
@@ -16,15 +19,15 @@ import logging
 import sys
 from typing import Any, Dict, List, Optional, Tuple
 
-from PySide6.QtCore import Qt, QTimer
-from PySide6.QtGui import QPalette, QImage, QPixmap, QColor
+from PySide6.QtCore import QByteArray, Qt, QTimer
+from PySide6.QtGui import QImage, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
     QComboBox,
     QDoubleSpinBox,
-    QFormLayout,
-    QGroupBox,
+    QFrame,
+    QGridLayout,
     QHBoxLayout,
     QInputDialog,
     QLabel,
@@ -34,15 +37,23 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QPushButton,
+    QScrollArea,
     QSlider,
-    QTabWidget,
     QVBoxLayout,
     QWidget,
 )
 
 from omnicam import __version__
+from omnicam import ui_theme as T
 from omnicam.app import OmniCamApp
+from omnicam.ui_theme import app_font, make_dark_palette  # noqa: F401 (re-export)
+from omnicam.ui_widgets import FormGrid, PreviewWidget, Section, SliderRow, StatsStrip
 from omnicam.virtualcam_out import VirtualCamError
+
+try:  # optional: saved phones + preferences (another module owns this file)
+    from omnicam import settings as _settings
+except ImportError:  # pragma: no cover - depends on checkout state
+    _settings = None  # type: ignore[assignment]
 
 log = logging.getLogger("omnicam.ui")
 
@@ -56,30 +67,17 @@ RESOLUTIONS: List[Tuple[int, int]] = [(1280, 720), (1920, 1080)]
 FPSES = [30, 24, 15]
 BITRATES_KBPS = [500, 1000, 2000, 3000, 6000]
 
+SIDEBAR_WIDTH = 312
 
-def make_dark_palette() -> QPalette:
-    """Build the standard dark Fusion palette."""
-    p = QPalette()
-    window = QColor(45, 45, 48)
-    base = QColor(30, 30, 32)
-    text = QColor(220, 220, 220)
-    disabled = QColor(120, 120, 120)
-    p.setColor(QPalette.ColorRole.Window, window)
-    p.setColor(QPalette.ColorRole.WindowText, text)
-    p.setColor(QPalette.ColorRole.Base, base)
-    p.setColor(QPalette.ColorRole.AlternateBase, window)
-    p.setColor(QPalette.ColorRole.ToolTipBase, QColor(60, 60, 64))
-    p.setColor(QPalette.ColorRole.ToolTipText, text)
-    p.setColor(QPalette.ColorRole.Text, text)
-    p.setColor(QPalette.ColorRole.Button, window)
-    p.setColor(QPalette.ColorRole.ButtonText, text)
-    p.setColor(QPalette.ColorRole.BrightText, QColor(255, 80, 80))
-    p.setColor(QPalette.ColorRole.Highlight, QColor(0, 120, 215))
-    p.setColor(QPalette.ColorRole.HighlightedText, QColor(255, 255, 255))
-    p.setColor(QPalette.ColorGroup.Disabled, QPalette.ColorRole.Text, disabled)
-    p.setColor(QPalette.ColorGroup.Disabled, QPalette.ColorRole.ButtonText, disabled)
-    p.setColor(QPalette.ColorGroup.Disabled, QPalette.ColorRole.WindowText, disabled)
-    return p
+# preference keys (omnicam.settings)
+PREF_AUTOCONNECT = "autoconnect"
+PREF_RES = "stream.res"
+PREF_FPS = "stream.fps"
+PREF_KBPS = "stream.kbps"
+PREF_GEOMETRY = "window.geometry"
+PREF_FILTERS_OPEN = "ui.filters_open"
+PREF_LOCAL_OPEN = "ui.local_open"
+PREF_STATS_DETAILS = "ui.stats_details"
 
 
 class MainWindow(QMainWindow):
@@ -88,7 +86,8 @@ class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle(f"OmniCam PC {__version__}")
-        self.resize(1280, 760)
+        self.resize(1280, 800)
+        self.setMinimumSize(1100, 700)
 
         self._app = OmniCamApp()
         self._app.start()
@@ -105,336 +104,561 @@ class MainWindow(QMainWindow):
         self._session_push_timer.setInterval(250)
         self._session_push_timer.timeout.connect(self._flush_session_controls)
         self._device_ips: Dict[int, str] = {}
+        self._connect_ip: Optional[str] = None  # last IP we asked to connect to
 
         self._build_ui()
+        self._restore_prefs()
         self._build_timers()
         self._show_import_warnings()
+        self._maybe_autoconnect()
+
+    # ------------------------------------------------------------------
+    # preferences (defensive: everything is optional)
+    # ------------------------------------------------------------------
+    @staticmethod
+    def prefs_available() -> bool:
+        """True when ``omnicam.settings`` imported."""
+        return _settings is not None
+
+    def _pref_get(self, key: str, default: Any = None) -> Any:
+        if _settings is None:
+            return default
+        try:
+            return _settings.get_pref(key, default)
+        except Exception:
+            log.exception("get_pref(%s) failed", key)
+            return default
+
+    def _pref_set(self, key: str, value: Any) -> None:
+        if _settings is None:
+            return
+        try:
+            _settings.set_pref(key, value)
+        except Exception:
+            log.exception("set_pref(%s) failed", key)
+
+    def _known_phones(self) -> List[Dict[str, Any]]:
+        try:
+            if hasattr(self._app, "known_phones"):
+                phones = self._app.known_phones()
+            elif _settings is not None:
+                phones = _settings.known_phones()
+            else:
+                return []
+        except Exception:
+            log.exception("known_phones failed")
+            return []
+        out: List[Dict[str, Any]] = []
+        for p in phones or []:
+            if isinstance(p, dict) and p.get("ip"):
+                out.append(p)
+        out.sort(key=lambda p: str(p.get("last_seen") or ""), reverse=True)
+        return out
+
+    def _remember_phone(self, ip: str, name: str = "", device: str = "") -> None:
+        if _settings is None:
+            return
+        try:
+            _settings.remember_phone(ip, name=name, device=device)
+        except Exception:
+            log.exception("remember_phone failed")
+        self._refresh_saved_phones()
 
     # ------------------------------------------------------------------
     # UI construction
     # ------------------------------------------------------------------
     def _build_ui(self) -> None:
         central = QWidget(self)
+        central.setObjectName("root")
         root = QHBoxLayout(central)
-        root.addWidget(self._build_left_panel(), 0)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
+        root.addWidget(self._build_sidebar(), 0)
         root.addWidget(self._build_center(), 1)
-        root.addWidget(self._build_right_tabs(), 0)
         self.setCentralWidget(central)
 
         self._status_conn = QLabel("disconnected")
+        self._status_conn.setObjectName("connPill")
+        self._status_conn.setProperty("connected", False)
         self._status_rtt = QLabel("RTT: -")
+        self._status_rtt.setObjectName("muted")
         self._status_msg = QLabel("")
         self._status_ver = QLabel(f"OmniCam PC v{__version__} - protocol v1")
+        self._status_ver.setObjectName("muted")
         bar = self.statusBar()
+        bar.setSizeGripEnabled(True)
+        bar.setContentsMargins(T.SPACE, 2, T.SPACE, 2)
         bar.addWidget(self._status_conn)
         bar.addWidget(self._status_rtt)
         bar.addWidget(self._status_msg, 1)
         bar.addPermanentWidget(self._status_ver)
 
-    def _build_left_panel(self) -> QWidget:
-        panel = QWidget(self)
-        lay = QVBoxLayout(panel)
+    def _build_sidebar(self) -> QWidget:
+        scroll = QScrollArea(self)
+        scroll.setObjectName("sidebar")
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setFixedWidth(SIDEBAR_WIDTH)
 
-        # -- Devices -----------------------------------------------------
-        dev_box = QGroupBox("Devices (UDP 9920 beacons)")
-        dev_lay = QVBoxLayout(dev_box)
-        self._device_list = self._mk_list(dev_lay)
+        panel = QWidget()
+        lay = QVBoxLayout(panel)
+        lay.setContentsMargins(T.SPACE + 4, T.SPACE + 4, T.SPACE + 4, T.SPACE + 4)
+        lay.setSpacing(T.SPACE + 2)
+
+        lay.addWidget(self._section_connection())
+        lay.addWidget(self._section_saved_phones())
+        lay.addWidget(self._section_stream())
+        lay.addWidget(self._section_camera())
+        lay.addWidget(self._section_phone_filters())
+        lay.addWidget(self._section_local_adjust())
+        lay.addWidget(self._section_virtual_cam())
+        lay.addStretch(1)
+        scroll.setWidget(panel)
+        return scroll
+
+    # -- section: connection ---------------------------------------------
+    def _section_connection(self) -> QWidget:
+        sec = Section("Connection")
+        hint = QLabel("Phones found via UDP 9920 beacons")
+        hint.setObjectName("muted")
+        sec.add(hint)
+        self._device_list = QListWidget()
+        self._device_list.setMinimumHeight(96)
+        self._device_list.setMaximumHeight(132)
+        self._device_list.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self._device_list.setTextElideMode(Qt.TextElideMode.ElideMiddle)
+        sec.add(self._device_list)
+
         manual_row = QHBoxLayout()
+        manual_row.setSpacing(T.SPACE)
         self._manual_ip = QLineEdit()
-        self._manual_ip.setPlaceholderText("manual IP (AP may block broadcast)")
+        self._manual_ip.setPlaceholderText("Manual IP, e.g. 192.168.1.20")
+        self._manual_ip.setToolTip("Access points may block broadcast beacons; type the phone IP.")
         self._manual_ip.returnPressed.connect(self._on_add_manual_ip)
         manual_row.addWidget(self._manual_ip, 1)
-        self._mk_button("Add", self._on_add_manual_ip, manual_row)
-        dev_lay.addLayout(manual_row)
+        self._btn_add_ip = self._mk_button("Add", self._on_add_manual_ip, manual_row)
+        sec.add_layout(manual_row)
+
         btn_row = QHBoxLayout()
-        self._btn_connect = self._mk_button("Connect", self._on_connect, btn_row)
+        btn_row.setSpacing(T.SPACE)
+        self._btn_connect = self._mk_button("Connect", self._on_connect, btn_row, accent=True)
         self._btn_disconnect = self._mk_button("Disconnect", self._on_disconnect, btn_row)
         self._btn_disconnect.setEnabled(False)
-        dev_lay.addLayout(btn_row)
-        lay.addWidget(dev_box)
+        sec.add_layout(btn_row)
 
-        # -- Stream ------------------------------------------------------
-        stream_box = QGroupBox("Stream")
-        form = QFormLayout(stream_box)
-        self._res_combo = self._mk_combo(form, "Resolution", [f"{w} x {h}" for w, h in RESOLUTIONS], 0)
-        self._fps_combo = self._mk_combo(form, "FPS", [str(f) for f in FPSES], 0)
-        self._kbps_combo = self._mk_combo(form, "Bitrate", [f"{b} kbps" for b in BITRATES_KBPS], 3)
+        self._autoconnect_check = QCheckBox("Autoconnect to last phone")
+        self._autoconnect_check.toggled.connect(self._on_autoconnect_toggled)
+        self._autoconnect_check.setEnabled(self.prefs_available())
+        if not self.prefs_available():
+            self._autoconnect_check.setToolTip("Requires omnicam.settings")
+        sec.add(self._autoconnect_check)
+        return sec
+
+    # -- section: saved phones -------------------------------------------
+    def _section_saved_phones(self) -> QWidget:
+        sec = Section("Saved phones")
+        self._saved_section = sec
+        self._saved_combo = QComboBox()
+        self._saved_combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        self._saved_combo.setMinimumContentsLength(12)
+        sec.add(self._saved_combo)
+        row = QHBoxLayout()
+        row.setSpacing(T.SPACE)
+        self._btn_saved_connect = self._mk_button("Connect", self._on_saved_connect, row)
+        self._btn_saved_forget = self._mk_button("Forget", self._on_saved_forget, row)
+        sec.add_layout(row)
+        self._saved_hint = QLabel("")
+        self._saved_hint.setObjectName("muted")
+        self._saved_hint.setWordWrap(True)
+        sec.add(self._saved_hint)
+        self._refresh_saved_phones()
+        return sec
+
+    # -- section: stream -------------------------------------------------
+    def _section_stream(self) -> QWidget:
+        sec = Section("Stream")
+        grid = FormGrid()
+        self._res_combo = self._mk_combo([f"{w} x {h}" for w, h in RESOLUTIONS], 0)
+        self._fps_combo = self._mk_combo([str(f) for f in FPSES], 0)
+        self._kbps_combo = self._mk_combo([f"{b} kbps" for b in BITRATES_KBPS], 3)
+        grid.add_row("Resolution", self._res_combo)
+        grid.add_row("Frame rate", self._fps_combo)
+        grid.add_row("Bitrate", self._kbps_combo)
         self._res_combo.currentIndexChanged.connect(self._on_session_controls_changed)
         self._fps_combo.currentIndexChanged.connect(self._on_session_controls_changed)
         self._kbps_combo.currentIndexChanged.connect(self._on_session_controls_changed)
-        self._abr_check = QCheckBox("Auto ABR (phone-side)")
+        self._abr_check = QCheckBox("Auto bitrate (phone-side ABR)")
         self._abr_check.setChecked(True)
         self._abr_check.toggled.connect(self._on_abr_toggled)
-        form.addRow("", self._abr_check)
+        grid.add_span(self._abr_check)
+        sec.add_layout(grid)
         srow = QHBoxLayout()
-        self._btn_start = self._mk_button("Start Stream", self._on_start_stream, srow)
+        srow.setSpacing(T.SPACE)
+        self._btn_start = self._mk_button("Start Stream", self._on_start_stream, srow, accent=True)
         self._btn_stop = self._mk_button("Stop Stream", self._on_stop_stream, srow)
         self._btn_start.setEnabled(False)
         self._btn_stop.setEnabled(False)
-        form.addRow("", srow)
-        lay.addWidget(stream_box)
+        sec.add_layout(srow)
+        return sec
 
-        # -- Camera ------------------------------------------------------
-        cam_box = QGroupBox("Camera")
-        cam_lay = QVBoxLayout(cam_box)
+    # -- section: camera -------------------------------------------------
+    def _section_camera(self) -> QWidget:
+        sec = Section("Camera")
         crow = QHBoxLayout()
+        crow.setSpacing(T.SPACE)
         self._btn_front = self._mk_button("Front", lambda: self._on_camera("front"), crow)
         self._btn_back = self._mk_button("Back", lambda: self._on_camera("back"), crow)
         self._btn_front.setEnabled(False)
         self._btn_back.setEnabled(False)
-        cam_lay.addLayout(crow)
+        sec.add_layout(crow)
+        grid = FormGrid()
         self._torch_check = QCheckBox("Torch (back camera only)")
         self._torch_check.setEnabled(False)
         self._torch_check.toggled.connect(self._on_torch)
-        cam_lay.addWidget(self._torch_check)
-        zoom_row = QHBoxLayout()
-        zoom_row.addWidget(QLabel("Zoom:"))
+        grid.add_span(self._torch_check)
         self._zoom_spin = QDoubleSpinBox()
         self._zoom_spin.setRange(1.0, 8.0)
         self._zoom_spin.setSingleStep(0.1)
         self._zoom_spin.setDecimals(2)
         self._zoom_spin.setValue(1.0)
+        self._zoom_spin.setSuffix(" x")
         self._zoom_spin.valueChanged.connect(self._on_zoom)
-        zoom_row.addWidget(self._zoom_spin, 1)
-        cam_lay.addLayout(zoom_row)
+        grid.add_row("Zoom", self._zoom_spin)
         self._cam_label = QLabel("camera: -")
-        cam_lay.addWidget(self._cam_label)
-        lay.addWidget(cam_box)
+        self._cam_label.setObjectName("muted")
+        grid.add_span(self._cam_label)
+        sec.add_layout(grid)
+        return sec
 
-        lay.addStretch(1)
-        return panel
-
-    def _build_center(self) -> QWidget:
-        holder = QWidget(self)
-        holder.setStyleSheet("background-color: #101012;")
-        lay = QVBoxLayout(holder)
-        lay.setContentsMargins(4, 4, 4, 4)
-        self._video_label = QLabel("no stream")
-        self._video_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._video_label.setStyleSheet("color: #808088; background-color: #101012;")
-        lay.addWidget(self._video_label, 1)
-        return holder
-
-    def _build_right_tabs(self) -> QWidget:
-        tabs = QTabWidget()
-        tabs.addTab(self._tab_virtual_cam(), "Virtual Cam")
-        tabs.addTab(self._tab_local_adjust(), "Local Adjust")
-        tabs.addTab(self._tab_phone_filters(), "Phone Filters")
-        tabs.addTab(self._tab_stats(), "Stats")
-        tabs.setMinimumWidth(330)
-        tabs.setMaximumWidth(400)
-        return tabs
-
-    # -- tab: virtual cam ------------------------------------------------
-    def _tab_virtual_cam(self) -> QWidget:
-        w = QWidget(self)
-        lay = QVBoxLayout(w)
-        src = QLabel("Source: this stream (decoded, locally adjusted)")
-        src.setWordWrap(True)
-        lay.addWidget(src)
-        btns = QHBoxLayout()
-        self._btn_vcam_start = self._mk_button("Start Virtual Camera", self._on_vcam_start, btns)
-        self._btn_vcam_stop = self._mk_button("Stop", self._on_vcam_stop, btns)
-        self._btn_vcam_stop.setEnabled(False)
-        lay.addLayout(btns)
-        form = QFormLayout()
-        self._vcam_backend = QLabel("-")
-        self._vcam_res = QLabel("-")
-        self._vcam_fps = QLabel("-")
-        self._vcam_sent = QLabel("0")
-        form.addRow("Backend:", self._vcam_backend)
-        form.addRow("Resolution:", self._vcam_res)
-        form.addRow("FPS:", self._vcam_fps)
-        form.addRow("Frames sent:", self._vcam_sent)
-        lay.addLayout(form)
-        self._vcam_status = QLabel("OBS Virtual Camera requires OBS Studio; "
-                                   "Unity Capture is the optional fallback.")
-        self._vcam_status.setWordWrap(True)
-        lay.addWidget(self._vcam_status)
-        lay.addStretch(1)
-        return w
-
-    # -- tab: local adjust -------------------------------------------------
-    def _tab_local_adjust(self) -> QWidget:
-        w = QWidget(self)
-        lay = QVBoxLayout(w)
-        note = QLabel("PC-only (after decode). Phone filters are shared.")
+    # -- section: phone filters (PROTOCOL.md S5) --------------------------
+    def _section_phone_filters(self) -> QWidget:
+        sec = Section("Phone Filters", collapsible=True, expanded=False)
+        self._filters_section = sec
+        sec.toggled.connect(lambda on: self._pref_set(PREF_FILTERS_OPEN, bool(on)))
+        note = QLabel("Mirrors the phone filter state; changes push to the phone "
+                      "automatically and phone-side edits update these controls.")
+        note.setObjectName("muted")
         note.setWordWrap(True)
-        lay.addWidget(note)
+        sec.add(note)
 
-        self._la_brightness = self._mk_slider(lay, "Brightness", -100, 100, 0, self._on_local_changed)
-        self._la_contrast = self._mk_slider(lay, "Contrast", -100, 100, 0, self._on_local_changed)
-        self._la_saturation = self._mk_slider(lay, "Saturation", 0, 200, 100, self._on_local_changed)
-        la_row = QHBoxLayout()
-        self._la_mirror = QCheckBox("Mirror")
-        self._la_flipv = QCheckBox("Flip V")
-        for cb in (self._la_mirror, self._la_flipv):
-            cb.toggled.connect(self._on_local_changed)
-            la_row.addWidget(cb)
-        lay.addLayout(la_row)
-        rot_row = QHBoxLayout()
-        rot_row.addWidget(QLabel("Rotate:"))
-        self._la_rotate = QComboBox()
-        self._la_rotate.addItems(["0", "90", "180", "270"])
-        self._la_rotate.currentIndexChanged.connect(self._on_local_changed)
-        rot_row.addWidget(self._la_rotate, 1)
-        lay.addLayout(rot_row)
-        self._mk_button("Reset local adjustments", self._on_local_reset, lay)
-        lay.addStretch(1)
-        return w
-
-    # -- tab: phone filters ------------------------------------------------
-    def _tab_phone_filters(self) -> QWidget:
-        w = QWidget(self)
-        lay = QVBoxLayout(w)
-        note = QLabel("Compact mirror of the phone filter state (PROTOCOL.md S5). "
-                      "Changes push to the phone automatically; phone-side changes "
-                      "update these controls. Full fine-tuning lives on the phone UI.")
-        note.setWordWrap(True)
-        lay.addWidget(note)
-
-        form = QFormLayout()
+        grid = FormGrid()
         self._pf_look = QComboBox()
         self._pf_look.addItems(LOOKS)
-        form.addRow("Look:", self._pf_look)
-        self._pf_beauty = self._mk_slider(form, "Beauty", 0, 100, 0, None)
+        grid.add_row("Look", self._pf_look)
+        self._pf_beauty = self._mk_slider(grid, "Beauty", 0, 100, 0, None)
         self._pf_stylize = QComboBox()
         self._pf_stylize.addItems(STYLIZES)
-        form.addRow("Stylize:", self._pf_stylize)
-        self._pf_amount = self._mk_slider(form, "Amount", 0, 100, 50, None)
-        lay.addLayout(form)
+        grid.add_row("Stylize", self._pf_stylize)
+        self._pf_amount = self._mk_slider(grid, "Amount", 0, 100, 50, None)
+        sec.add_layout(grid)
 
-        geo = QGroupBox("Geometry")
-        gform = QFormLayout(geo)
-        grow1 = QHBoxLayout()
+        geo_title = QLabel("Geometry")
+        geo_title.setObjectName("fieldLabel")
+        sec.add(geo_title)
+        ggrid = FormGrid()
+        grow = QHBoxLayout()
+        grow.setSpacing(T.SPACE * 2)
         self._pf_mirror = QCheckBox("Mirror")
-        self._pf_flipv = QCheckBox("Flip V")
-        grow1.addWidget(self._pf_mirror)
-        grow1.addWidget(self._pf_flipv)
-        gform.addRow("", grow1)
-        grow2 = QHBoxLayout()
-        grow2.addWidget(QLabel("Rotate:"))
+        self._pf_flipv = QCheckBox("Flip vertical")
+        grow.addWidget(self._pf_mirror)
+        grow.addWidget(self._pf_flipv)
+        grow.addStretch(1)
+        gwrap = QWidget()
+        gwrap.setLayout(grow)
+        ggrid.add_span(gwrap)
         self._pf_rotate = QComboBox()
         self._pf_rotate.addItems(["0", "90", "180", "270"])
-        grow2.addWidget(self._pf_rotate, 1)
-        gform.addRow("", grow2)
+        ggrid.add_row("Rotate", self._pf_rotate)
         self._pf_zoom = QDoubleSpinBox()
         self._pf_zoom.setRange(1.0, 8.0)
         self._pf_zoom.setSingleStep(0.1)
         self._pf_zoom.setDecimals(2)
-        gform.addRow("Zoom:", self._pf_zoom)
-        self._pf_panx = self._mk_slider(gform, "Pan X", -100, 100, 0, None)
-        self._pf_pany = self._mk_slider(gform, "Pan Y", -100, 100, 0, None)
-        lay.addWidget(geo)
+        self._pf_zoom.setSuffix(" x")
+        ggrid.add_row("Zoom", self._pf_zoom)
+        self._pf_panx = self._mk_slider(ggrid, "Pan X", -100, 100, 0, None)
+        self._pf_pany = self._mk_slider(ggrid, "Pan Y", -100, 100, 0, None)
+        sec.add_layout(ggrid)
 
         # push-on-change wiring (all filter controls)
-        for widget, sig in (
-            (self._pf_look, self._pf_look.currentIndexChanged),
-            (self._pf_beauty, self._pf_beauty.valueChanged),
-            (self._pf_stylize, self._pf_stylize.currentIndexChanged),
-            (self._pf_amount, self._pf_amount.valueChanged),
-            (self._pf_mirror, self._pf_mirror.toggled),
-            (self._pf_flipv, self._pf_flipv.toggled),
-            (self._pf_rotate, self._pf_rotate.currentIndexChanged),
-            (self._pf_zoom, self._pf_zoom.valueChanged),
-            (self._pf_panx, self._pf_panx.valueChanged),
-            (self._pf_pany, self._pf_pany.valueChanged),
+        for sig in (
+            self._pf_look.currentIndexChanged,
+            self._pf_beauty.valueChanged,
+            self._pf_stylize.currentIndexChanged,
+            self._pf_amount.valueChanged,
+            self._pf_mirror.toggled,
+            self._pf_flipv.toggled,
+            self._pf_rotate.currentIndexChanged,
+            self._pf_zoom.valueChanged,
+            self._pf_panx.valueChanged,
+            self._pf_pany.valueChanged,
         ):
             sig.connect(self._push_phone_filters)
+        return sec
 
-        lay.addStretch(1)
-        return w
+    # -- section: local adjust (PC only) ----------------------------------
+    def _section_local_adjust(self) -> QWidget:
+        sec = Section("Local Adjust", collapsible=True, expanded=False)
+        self._local_section = sec
+        sec.toggled.connect(lambda on: self._pref_set(PREF_LOCAL_OPEN, bool(on)))
+        note = QLabel("PC-only, applied after decode to the preview and virtual camera.")
+        note.setObjectName("muted")
+        note.setWordWrap(True)
+        sec.add(note)
+        grid = FormGrid()
+        self._la_brightness = self._mk_slider(grid, "Brightness", -100, 100, 0, self._on_local_changed)
+        self._la_contrast = self._mk_slider(grid, "Contrast", -100, 100, 0, self._on_local_changed)
+        self._la_saturation = self._mk_slider(grid, "Saturation", 0, 200, 100, self._on_local_changed)
+        la_row = QHBoxLayout()
+        la_row.setSpacing(T.SPACE * 2)
+        self._la_mirror = QCheckBox("Mirror")
+        self._la_flipv = QCheckBox("Flip vertical")
+        for cb in (self._la_mirror, self._la_flipv):
+            cb.toggled.connect(self._on_local_changed)
+            la_row.addWidget(cb)
+        la_row.addStretch(1)
+        la_wrap = QWidget()
+        la_wrap.setLayout(la_row)
+        grid.add_span(la_wrap)
+        self._la_rotate = QComboBox()
+        self._la_rotate.addItems(["0", "90", "180", "270"])
+        self._la_rotate.currentIndexChanged.connect(self._on_local_changed)
+        grid.add_row("Rotate", self._la_rotate)
+        sec.add_layout(grid)
+        self._btn_local_reset = self._mk_button("Reset local adjustments", self._on_local_reset,
+                                                sec.layout_body())
+        return sec
 
-    # -- tab: stats ----------------------------------------------------------
-    def _tab_stats(self) -> QWidget:
-        w = QWidget(self)
-        lay = QVBoxLayout(w)
+    # -- section: virtual camera -----------------------------------------
+    def _section_virtual_cam(self) -> QWidget:
+        sec = Section("Virtual Camera")
+        src = QLabel("Source: this stream (decoded, locally adjusted)")
+        src.setObjectName("muted")
+        src.setWordWrap(True)
+        sec.add(src)
+        btns = QHBoxLayout()
+        btns.setSpacing(T.SPACE)
+        self._btn_vcam_start = self._mk_button("Start Virtual Camera", self._on_vcam_start, btns,
+                                               accent=True)
+        self._btn_vcam_stop = self._mk_button("Stop", self._on_vcam_stop, btns)
+        self._btn_vcam_stop.setEnabled(False)
+        sec.add_layout(btns)
+        grid = FormGrid()
+        self._vcam_backend = QLabel("-")
+        self._vcam_res = QLabel("-")
+        self._vcam_fps = QLabel("-")
+        self._vcam_sent = QLabel("0")
+        grid.add_row("Backend", self._vcam_backend)
+        grid.add_row("Resolution", self._vcam_res)
+        grid.add_row("FPS", self._vcam_fps)
+        grid.add_row("Frames sent", self._vcam_sent)
+        sec.add_layout(grid)
+        self._vcam_status = QLabel("OBS Virtual Camera requires OBS Studio; "
+                                   "Unity Capture is the optional fallback.")
+        self._vcam_status.setObjectName("muted")
+        self._vcam_status.setWordWrap(True)
+        sec.add(self._vcam_status)
+        return sec
+
+    # -- centre: preview + stats -----------------------------------------
+    def _build_center(self) -> QWidget:
+        holder = QWidget(self)
+        lay = QVBoxLayout(holder)
+        lay.setContentsMargins(T.SPACE + 4, T.SPACE + 4, T.SPACE + 4, T.SPACE + 4)
+        lay.setSpacing(T.SPACE + 2)
+
+        self._video_label = PreviewWidget()
+        lay.addWidget(self._video_label, 1)
+
+        self._stats_strip = StatsStrip((
+            ("fps_decoded", "FPS"),
+            ("bitrate_kbps", "kbps"),
+            ("loss_pct", "Loss"),
+            ("rtt_ms", "RTT"),
+            ("g2g_ms", "Latency"),
+            ("drops", "Dropped"),
+        ))
+        self._btn_stats_details = QPushButton("Details")
+        self._btn_stats_details.setCheckable(True)
+        self._btn_stats_details.setProperty("toggle", True)
+        self._btn_stats_details.toggled.connect(self._on_stats_details_toggled)
+        self._stats_strip.trailing.addWidget(self._btn_stats_details)
+        lay.addWidget(self._stats_strip, 0)
+
+        self._stats_details = self._build_stats_details()
+        self._stats_details.setVisible(False)
+        lay.addWidget(self._stats_details, 0)
+        return holder
+
+    def _build_stats_details(self) -> QWidget:
+        frame = QFrame()
+        frame.setObjectName("statsStrip")
+        grid = QGridLayout(frame)
+        grid.setContentsMargins(T.SPACE + 4, T.SPACE, T.SPACE + 4, T.SPACE)
+        grid.setHorizontalSpacing(T.SPACE * 2)
+        grid.setVerticalSpacing(4)
         self._stat_labels: Dict[str, QLabel] = {}
-        form = QFormLayout()
-        for key, title in (
+
+        pc_items = (
             ("fps_decoded", "Decoded FPS"),
             ("fps_displayed", "Displayed FPS"),
             ("bitrate_kbps", "Video bitrate (measured)"),
-            ("loss_pct", "Packet loss"),
-            ("rtt_ms", "RTT (ping/pong)"),
-            ("g2g_ms", "Glass-to-glass (est.)"),
+            ("loss_pct", "Packet loss %"),
+            ("rtt_ms", "RTT (ping/pong) ms"),
+            ("g2g_ms", "Glass-to-glass (est.) ms"),
             ("nacks_sent", "NACKs sent"),
             ("plis_sent", "PLIs sent"),
             ("drops", "Dropped frames"),
             ("late_frames", "Late frames"),
             ("dup_packets", "Duplicate packets"),
-            ("jitter_ms", "Jitter (est.)"),
+            ("jitter_ms", "Jitter (est.) ms"),
             ("fec_recovered", "FEC recovered pkts"),
             ("fec_active", "FEC active"),
-        ):
-            lbl = QLabel("-")
-            self._stat_labels[key] = lbl
-            form.addRow(f"{title}:", lbl)
-        lay.addLayout(form)
-        phone_box = QGroupBox("Phone-reported stats (1 s)")
-        pform = QFormLayout(phone_box)
-        for key, title in (
-            ("fps", "FPS"),
-            ("kbps", "Bitrate"),
-            ("enc_ms", "Encode ms"),
-            ("loss_pct", "Loss %"),
-            ("nacks", "NACKs received"),
-            ("sent", "Packets sent"),
-        ):
-            lbl = QLabel("-")
-            self._stat_labels[f"phone_{key}"] = lbl
-            pform.addRow(f"{title}:", lbl)
-        lay.addWidget(phone_box)
-        lay.addStretch(1)
-        return w
+        )
+        phone_items = (
+            ("phone_fps", "FPS"),
+            ("phone_kbps", "Bitrate kbps"),
+            ("phone_enc_ms", "Encode ms"),
+            ("phone_loss_pct", "Loss %"),
+            ("phone_nacks", "NACKs received"),
+            ("phone_sent", "Packets sent"),
+        )
+
+        def header(text: str, row: int, col: int) -> None:
+            h = QLabel(text)
+            h.setObjectName("statKey")
+            grid.addWidget(h, row, col, 1, 2)
+
+        def add(key: str, title: str, row: int, col: int) -> None:
+            k = QLabel(title)
+            k.setObjectName("fieldLabel")
+            v = QLabel("-")
+            v.setObjectName("value")
+            v.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            grid.addWidget(k, row, col)
+            grid.addWidget(v, row, col + 1)
+            self._stat_labels[key] = v
+
+        header("Receiver (PC)", 0, 0)
+        header("", 0, 2)
+        header("Phone-reported (1 s)", 0, 4)
+        half = (len(pc_items) + 1) // 2
+        for i, (key, title) in enumerate(pc_items):
+            col = 0 if i < half else 2
+            add(key, title, 1 + (i % half), col)
+        for i, (key, title) in enumerate(phone_items):
+            add(key, title, 1 + i, 4)
+        for c in (1, 3, 5):
+            grid.setColumnMinimumWidth(c, 56)
+        grid.setColumnStretch(6, 1)
+        return frame
 
     # -- small widget helpers ------------------------------------------------
     @staticmethod
-    def _mk_list(parent: QVBoxLayout) -> QListWidget:
-        lst = QListWidget()
-        lst.setMinimumHeight(140)
-        parent.addWidget(lst, 1)
-        return lst
-
-    @staticmethod
-    def _mk_button(text: str, handler: Any, parent: Any) -> QPushButton:
+    def _mk_button(text: str, handler: Any, parent: Any, accent: bool = False) -> QPushButton:
         btn = QPushButton(text)
+        if accent:
+            btn.setProperty("accent", True)
         btn.clicked.connect(handler)
         parent.addWidget(btn)
         return btn
 
     @staticmethod
-    def _mk_combo(form: QFormLayout, title: str, items: List[str], default: int) -> QComboBox:
+    def _mk_combo(items: List[str], default: int) -> QComboBox:
         combo = QComboBox()
         combo.addItems(items)
         combo.setCurrentIndex(default)
-        form.addRow(title + ":", combo)
         return combo
 
     @staticmethod
     def _mk_slider(parent: Any, title: str, lo: int, hi: int, default: int,
                    handler: Any) -> QSlider:
-        slider = QSlider(Qt.Orientation.Horizontal)
-        slider.setRange(lo, hi)
-        slider.setValue(default)
-        row = QHBoxLayout()
-        label = QLabel(f"{title}: {default}")
-        val = QLabel(str(default))
-        row.addWidget(label, 0)
-        row.addWidget(slider, 1)
-        row.addWidget(val, 0)
-        slider.valueChanged.connect(lambda v: val.setText(str(v)))
+        row = SliderRow(title, lo, hi, default)
         if handler is not None:
-            slider.valueChanged.connect(handler)
-        if isinstance(parent, QVBoxLayout):
-            wrap: Any = QWidget()
-            wrap.setLayout(row)
-            parent.addWidget(wrap)
+            row.slider.valueChanged.connect(handler)
+        if isinstance(parent, FormGrid):
+            parent.add_span(row)
         else:
-            wrap2: Any = QWidget()
-            wrap2.setLayout(row)
-            parent.addRow("", wrap2)
-        return slider
+            parent.addWidget(row)
+        return row.slider
+
+    # ------------------------------------------------------------------
+    # preferences: restore / persist
+    # ------------------------------------------------------------------
+    def _restore_prefs(self) -> None:
+        """Apply saved combos, section state and window geometry (all optional)."""
+        was = self._syncing_session
+        self._syncing_session = True
+        try:
+            res = self._pref_get(PREF_RES)
+            if isinstance(res, str) and "x" in res:
+                try:
+                    w, h = (int(v) for v in res.lower().split("x"))
+                    if (w, h) in RESOLUTIONS:
+                        self._res_combo.setCurrentIndex(RESOLUTIONS.index((w, h)))
+                except ValueError:
+                    pass
+            fps = self._pref_get(PREF_FPS)
+            if isinstance(fps, int) and fps in FPSES:
+                self._fps_combo.setCurrentIndex(FPSES.index(fps))
+            kbps = self._pref_get(PREF_KBPS)
+            if isinstance(kbps, int) and kbps in BITRATES_KBPS:
+                self._kbps_combo.setCurrentIndex(BITRATES_KBPS.index(kbps))
+        finally:
+            self._syncing_session = was
+        self._session_push_timer.stop()
+
+        # default True matches OmniCamApp.autoconnect_last(); unavailable -> off
+        self._autoconnect_check.blockSignals(True)
+        self._autoconnect_check.setChecked(
+            self.prefs_available() and bool(self._pref_get(PREF_AUTOCONNECT, True)))
+        self._autoconnect_check.blockSignals(False)
+        self._filters_section.set_expanded(bool(self._pref_get(PREF_FILTERS_OPEN, False)))
+        self._local_section.set_expanded(bool(self._pref_get(PREF_LOCAL_OPEN, False)))
+        self._btn_stats_details.setChecked(bool(self._pref_get(PREF_STATS_DETAILS, False)))
+
+        geo = self._pref_get(PREF_GEOMETRY)
+        if isinstance(geo, str) and geo:
+            try:
+                ba = QByteArray.fromHex(geo.encode("ascii"))
+                if not ba.isEmpty():
+                    self.restoreGeometry(ba)
+            except Exception:
+                log.exception("bad saved geometry (ignored)")
+
+    def _save_stream_prefs(self) -> None:
+        idx = self._res_combo.currentIndex()
+        if 0 <= idx < len(RESOLUTIONS):
+            w, h = RESOLUTIONS[idx]
+            self._pref_set(PREF_RES, f"{w}x{h}")
+        if 0 <= self._fps_combo.currentIndex() < len(FPSES):
+            self._pref_set(PREF_FPS, FPSES[self._fps_combo.currentIndex()])
+        if 0 <= self._kbps_combo.currentIndex() < len(BITRATES_KBPS):
+            self._pref_set(PREF_KBPS, BITRATES_KBPS[self._kbps_combo.currentIndex()])
+
+    def _save_geometry_pref(self) -> None:
+        try:
+            self._pref_set(PREF_GEOMETRY, bytes(self.saveGeometry().toHex()).decode("ascii"))
+        except Exception:
+            log.exception("saveGeometry failed")
+
+    def _maybe_autoconnect(self) -> None:
+        """Kick ``autoconnect_last`` once the event loop runs (if enabled)."""
+        if not self._autoconnect_check.isChecked():
+            return
+        if not hasattr(self._app, "autoconnect_last"):
+            return
+
+        def go() -> None:
+            try:
+                res = self._app.autoconnect_last()
+                if res:
+                    self._set_status(f"autoconnecting to {res}")
+                    self._connect_ip = str(res)
+            except Exception:
+                log.exception("autoconnect_last failed")
+
+        QTimer.singleShot(0, go)
 
     # ------------------------------------------------------------------
     # timers
@@ -452,6 +676,11 @@ class MainWindow(QMainWindow):
         self._device_timer.timeout.connect(self._refresh_devices)
         self._device_timer.start(1000)
         self._refresh_devices()
+
+        # the app remembers beacon phones itself; pick those up every 5 s
+        self._saved_timer = QTimer(self)
+        self._saved_timer.timeout.connect(self._refresh_saved_phones)
+        self._saved_timer.start(5000)
 
         self._stats_timer = QTimer(self)
         self._stats_timer.timeout.connect(self._refresh_stats)
@@ -471,7 +700,7 @@ class MainWindow(QMainWindow):
         QMessageBox.warning(self, "OmniCam PC - missing components", text)
 
     # ------------------------------------------------------------------
-    # left panel actions
+    # connection actions
     # ------------------------------------------------------------------
     def _on_connect(self) -> None:
         ip = self._manual_ip.text().strip() or self._selected_device_ip() or ""
@@ -484,10 +713,15 @@ class MainWindow(QMainWindow):
         if parsed is None:
             QMessageBox.warning(self, "Manual IP", f"Not a valid IPv4 address:\n{ip}")
             return
-        self._app.pin_device(parsed)
+        self._connect_to(parsed)
+
+    def _connect_to(self, ip: str) -> None:
+        """Pin, select and connect the control channel to ``ip``."""
+        self._connect_ip = ip
+        self._app.pin_device(ip)
         self._refresh_devices()
-        self._select_device_ip(parsed)
-        self._app.connect(parsed)
+        self._select_device_ip(ip)
+        self._app.connect(ip)
 
     def _on_add_manual_ip(self) -> None:
         ip = self._parse_ipv4(self._manual_ip.text())
@@ -527,12 +761,77 @@ class MainWindow(QMainWindow):
                 return
 
     def _on_disconnect(self) -> None:
-        self._app.disconnect()
+        self._app.disconnect()  # sends bye
 
+    # -- saved phones -----------------------------------------------------
+    def _selected_saved_ip(self) -> Optional[str]:
+        ip = self._saved_combo.currentData(Qt.ItemDataRole.UserRole)
+        return str(ip) if ip else None
+
+    def _refresh_saved_phones(self) -> None:
+        phones = self._known_phones()
+        current = self._selected_saved_ip()
+        self._saved_combo.blockSignals(True)
+        self._saved_combo.clear()
+        for p in phones:
+            ip = str(p.get("ip"))
+            name = str(p.get("name") or p.get("device") or "").strip()
+            label = f"{name}  {ip}" if name else ip
+            self._saved_combo.addItem(label, ip)
+        if current:
+            idx = self._saved_combo.findData(current)
+            if idx >= 0:
+                self._saved_combo.setCurrentIndex(idx)
+        self._saved_combo.blockSignals(False)
+        have = bool(phones)
+        self._saved_combo.setEnabled(have)
+        self._btn_saved_connect.setEnabled(have)
+        self._btn_saved_forget.setEnabled(have)
+        if not self.prefs_available():
+            self._saved_hint.setText("Saved phones need omnicam.settings (not installed).")
+        elif not have:
+            self._saved_hint.setText("Phones are remembered after the first successful connect.")
+        else:
+            self._saved_hint.setText("")
+        self._saved_hint.setVisible(bool(self._saved_hint.text()))
+
+    def _on_saved_connect(self) -> None:
+        ip = self._selected_saved_ip()
+        if not ip:
+            return
+        parsed = self._parse_ipv4(ip)
+        if parsed is None:
+            QMessageBox.warning(self, "Saved phone", f"Not a valid IPv4 address:\n{ip}")
+            return
+        self._connect_to(parsed)
+
+    def _on_saved_forget(self) -> None:
+        ip = self._selected_saved_ip()
+        if not ip:
+            return
+        try:
+            if hasattr(self._app, "forget_phone"):
+                self._app.forget_phone(ip)
+            elif _settings is not None:
+                _settings.forget_phone(ip)
+            else:
+                return
+        except Exception:
+            log.exception("forget_phone failed")
+        self._refresh_saved_phones()
+        self._set_status(f"forgot {ip}")
+
+    def _on_autoconnect_toggled(self, on: bool) -> None:
+        self._pref_set(PREF_AUTOCONNECT, bool(on))
+
+    # ------------------------------------------------------------------
+    # stream / camera actions
+    # ------------------------------------------------------------------
     def _on_start_stream(self) -> None:
         w, h = RESOLUTIONS[self._res_combo.currentIndex()]
         fps = FPSES[self._fps_combo.currentIndex()]
         kbps = BITRATES_KBPS[self._kbps_combo.currentIndex()]
+        self._save_stream_prefs()
         self._app.start_stream(w, h, fps, kbps)
 
     def _on_stop_stream(self) -> None:
@@ -572,6 +871,7 @@ class MainWindow(QMainWindow):
         """Debounce encode size/fps/bitrate so 1080↔720 cannot tear both apps down."""
         if self._syncing_session:
             return
+        self._save_stream_prefs()
         self._session_push_timer.start()
 
     def _flush_session_controls(self) -> None:
@@ -586,7 +886,7 @@ class MainWindow(QMainWindow):
         self._app.push_session({"w": w, "h": h, "fps": fps, "kbps": kbps})
 
     # ------------------------------------------------------------------
-    # virtual cam tab
+    # virtual camera
     # ------------------------------------------------------------------
     def _on_vcam_start(self) -> None:
         try:
@@ -608,7 +908,7 @@ class MainWindow(QMainWindow):
         self._vcam_fps.setText("-")
 
     # ------------------------------------------------------------------
-    # local adjust tab
+    # local adjust
     # ------------------------------------------------------------------
     def _on_local_changed(self, *_: Any) -> None:
         self._app.set_local_adjust(
@@ -636,7 +936,7 @@ class MainWindow(QMainWindow):
         self._on_local_changed()
 
     # ------------------------------------------------------------------
-    # phone filters tab
+    # phone filters
     # ------------------------------------------------------------------
     def _push_phone_filters(self, *_: Any) -> None:
         """Coalesce slider drags — a flood of filter JSON stalled the phone TCP thread."""
@@ -704,24 +1004,30 @@ class MainWindow(QMainWindow):
     def _render_frame(self) -> None:
         seq, frame = self._app.get_preview_frame(self._preview_seq)
         if frame is None or frame.size == 0:
+            if not self._app.streaming and self._video_label.has_frame():
+                self._video_label.set_pixmap(None)
             return
         self._preview_seq = seq
         self._app.stats.tick_displayed()
         h, w = frame.shape[:2]
         img = QImage(frame.data, w, h, w * 3, QImage.Format.Format_BGR888)
         pm = QPixmap.fromImage(img)  # copies pixel data out of the numpy buffer
-        self._video_label.setPixmap(pm.scaled(
-            self._video_label.size(),
-            Qt.AspectRatioMode.KeepAspectRatio,
-            Qt.TransformationMode.FastTransformation))
+        self._video_label.set_pixmap(pm)  # scaled with KeepAspectRatio in paintEvent
+
+    def _set_connected_pill(self, connected: bool, text: str) -> None:
+        self._status_conn.setText(("connected" if connected else "disconnected") +
+                                  (f" ({text})" if text else ""))
+        self._status_conn.setProperty("connected", bool(connected))
+        st = self._status_conn.style()
+        st.unpolish(self._status_conn)
+        st.polish(self._status_conn)
 
     def _poll_events(self) -> None:
         for kind, payload in self._app.drain_events():
             if kind == "state":
                 connected = bool(payload.get("connected"))
                 text = str(payload.get("text", ""))
-                self._status_conn.setText(("connected" if connected else "disconnected") +
-                                          (f" ({text})" if text else ""))
+                self._set_connected_pill(connected, text)
                 self._btn_disconnect.setEnabled(connected)
                 self._btn_connect.setEnabled(not connected)
                 streaming = self._app.streaming
@@ -730,6 +1036,9 @@ class MainWindow(QMainWindow):
                 self._btn_front.setEnabled(connected)
                 self._btn_back.setEnabled(connected)
                 self._torch_check.setEnabled(connected and self._app.get_camera() == "back")
+                if not connected:
+                    self._video_label.set_placeholder("No stream",
+                                                      "Connect a phone and press Start Stream")
             elif kind == "devices":
                 self._refresh_devices()
             elif kind == "welcome":
@@ -745,6 +1054,8 @@ class MainWindow(QMainWindow):
                     self._apply_camera_caps()
                 self._set_status(f"welcome from {dev} (iOS {ios})")
                 self._btn_start.setEnabled(True)
+                self._video_label.set_placeholder("Connected", "Press Start Stream")
+                self._remember_connected_phone(str(dev))
             elif kind == "started":
                 self._btn_start.setEnabled(False)
                 self._btn_stop.setEnabled(True)
@@ -758,6 +1069,7 @@ class MainWindow(QMainWindow):
                     self._set_status(f"streaming (rtp_host={host}; phone prefers control peer IP)")
                 else:
                     self._set_status("streaming")
+                self._video_label.set_placeholder("Waiting for video", "")
             elif kind == "stopped":
                 self._btn_start.setEnabled(self.control_connected())
                 self._btn_stop.setEnabled(False)
@@ -765,6 +1077,8 @@ class MainWindow(QMainWindow):
                     self._set_status("stream stopped")
                 else:
                     self._set_status("stream stopped by phone")
+                self._video_label.set_pixmap(None)
+                self._video_label.set_placeholder("Stream stopped", "Press Start Stream")
             elif kind == "session":
                 state = payload.get("state")
                 if isinstance(state, dict):
@@ -793,6 +1107,28 @@ class MainWindow(QMainWindow):
                 elif code in ("nosuch", "badmsg"):
                     QMessageBox.warning(self, "Phone error",
                                         f"The phone reported an error: {code}\n{msg}")
+
+    def _remember_connected_phone(self, device: str) -> None:
+        """Persist the phone we just got ``welcome`` from (saved phones).
+
+        Newer ``OmniCamApp`` builds remember phones themselves; then we only
+        refresh the list.  Older builds get the UI-side fallback.
+        """
+        if hasattr(self._app, "known_phones"):
+            self._refresh_saved_phones()
+            return
+        ip = self._connect_ip
+        if not ip:
+            target = getattr(self._app.control, "target_ip", None)
+            ip = str(target) if target else None
+        if not ip:
+            return
+        name = ""
+        for dev in self._app.get_devices():
+            if dev.get("ip") == ip and dev.get("name") and dev.get("model") != "manual":
+                name = str(dev["name"])
+                break
+        self._remember_phone(ip, name=name, device=device)
 
     def control_connected(self) -> bool:
         """Expose control-channel state for button enabling."""
@@ -896,21 +1232,38 @@ class MainWindow(QMainWindow):
         # Rebuild only when the set of rows changed — clearing every 1 s made
         # the list (and selection) strobe on flaky laptop Wi-Fi.
         existing = []
+        has_placeholder = False
         for i in range(self._device_list.count()):
             it = self._device_list.item(i)
+            if it.data(Qt.ItemDataRole.UserRole) is None:
+                has_placeholder = True
+                continue
             existing.append((it.text(), it.data(Qt.ItemDataRole.UserRole)))
-        if existing == labels:
+        if existing == labels and (labels or has_placeholder):
             return
         self._device_list.clear()
         if not labels:
-            self._device_list.addItem(QListWidgetItem("searching for phones..."))
+            placeholder = QListWidgetItem("Searching for phones...")
+            placeholder.setFlags(Qt.ItemFlag.NoItemFlags)
+            self._device_list.addItem(placeholder)
             return
         for label, ip in labels:
             item = QListWidgetItem(label)
             item.setData(Qt.ItemDataRole.UserRole, ip)
+            item.setToolTip(label)
             self._device_list.addItem(item)
             if ip == current:
                 self._device_list.setCurrentItem(item)
+
+    @staticmethod
+    def _fmt(val: Any, suffix: str = "", digits: int = 1) -> str:
+        if val is None:
+            return "-"
+        if isinstance(val, bool):
+            return "yes" if val else "no"
+        if isinstance(val, float):
+            return f"{val:.{digits}f}{suffix}"
+        return f"{val}{suffix}"
 
     def _refresh_stats(self) -> None:
         snap = self._app.get_stats_snapshot()
@@ -926,6 +1279,14 @@ class MainWindow(QMainWindow):
         for key in ("fps", "kbps", "enc_ms", "loss_pct", "nacks", "sent"):
             val = phone.get(key)
             self._stat_labels[f"phone_{key}"].setText("-" if val is None else str(val))
+        # slim strip
+        self._stats_strip.set_value("fps_decoded", self._fmt(snap.get("fps_decoded")))
+        kbps = snap.get("bitrate_kbps") or snap.get("kbps_measured")  # receiver fallback
+        self._stats_strip.set_value("bitrate_kbps", self._fmt(kbps, digits=0))
+        self._stats_strip.set_value("loss_pct", self._fmt(snap.get("loss_pct"), " %", 2))
+        self._stats_strip.set_value("rtt_ms", self._fmt(snap.get("rtt_ms"), " ms"))
+        self._stats_strip.set_value("g2g_ms", self._fmt(snap.get("g2g_ms"), " ms", 0))
+        self._stats_strip.set_value("drops", self._fmt(snap.get("drops")))
         if self._app.vcam.running:
             dims = self._app.vcam.dims
             if dims:
@@ -933,17 +1294,30 @@ class MainWindow(QMainWindow):
                 self._vcam_fps.setText(str(dims[2]))
             self._vcam_sent.setText(str(self._app.vcam.frames_sent))
 
+    def _on_stats_details_toggled(self, on: bool) -> None:
+        self._stats_details.setVisible(bool(on))
+        self._pref_set(PREF_STATS_DETAILS, bool(on))
+
     def _set_status(self, text: str) -> None:
         self._status_msg.setText(text)
 
     # ------------------------------------------------------------------
     def closeEvent(self, event: Any) -> None:
         """Graceful shutdown of every thread and socket."""
+        self._save_geometry_pref()
         try:
             self._app.shutdown()
         except Exception:
             log.exception("shutdown failed")
         super().closeEvent(event)
+
+
+def apply_theme(app: QApplication) -> None:
+    """Fusion + dark palette + style sheet (idempotent)."""
+    app.setStyle("Fusion")
+    app.setFont(app_font())
+    app.setPalette(make_dark_palette())
+    app.setStyleSheet(T.build_stylesheet())
 
 
 def main() -> int:
@@ -952,8 +1326,7 @@ def main() -> int:
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     app = QApplication(sys.argv)
-    app.setStyle("Fusion")
-    app.setPalette(make_dark_palette())
+    apply_theme(app)
     win = MainWindow()
     win.show()
     return app.exec()

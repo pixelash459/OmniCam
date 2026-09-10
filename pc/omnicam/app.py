@@ -20,6 +20,7 @@ from typing import Any, Deque, Dict, List, Optional, Tuple
 import numpy as np
 
 from omnicam import __version__
+from omnicam import settings
 from omnicam.net import (
     VIDEO_PORT,
     BeaconListener,
@@ -107,6 +108,7 @@ class OmniCamApp:
         self.control = ControlClient(on_message=self._on_message, on_state=self._on_state,
                                      on_rtt=self._on_rtt)
         self.beacons = BeaconListener()
+        self.beacons.set_beacon_callback(self._on_beacon)
         self.video_rx = VideoReceiver()
         self.vcam = VirtualCamOut()
 
@@ -214,6 +216,41 @@ class OmniCamApp:
     def pin_device(self, ip: str) -> None:
         """Keep a typed IP in the device list even without UDP beacons."""
         self.beacons.pin(ip)
+
+    def known_phones(self) -> List[Dict[str, Any]]:
+        """Phones remembered across runs (beacon or successful handshake),
+        most recent first: ``{"ip","name","last_seen","device"}``."""
+        return settings.known_phones()
+
+    def forget_phone(self, ip: str) -> None:
+        """Drop ``ip`` from the persisted known-phones list."""
+        settings.forget_phone(ip)
+
+    def discovery_diagnostics(self) -> Dict[str, Any]:
+        """Beacon listener bind/receive counters (for a "why no phones?" hint)."""
+        return self.beacons.diagnostics()
+
+    def autoconnect_last(self) -> Optional[str]:
+        """Connect to the most recently seen known phone when the ``autoconnect``
+        pref is true (default).  Returns the IP used, or ``None``.
+
+        Intended to be called once by the UI at startup; a no-op when already
+        targeting a phone or when nothing is remembered.
+        """
+        if not bool(settings.get_pref("autoconnect", True)):
+            return None
+        if self.control.target_ip:
+            return None
+        phones = settings.known_phones()
+        if not phones:
+            return None
+        ip = str(phones[0].get("ip", "")).strip()
+        if not ip:
+            return None
+        log.info("autoconnect: last known phone %s (%s)", ip, phones[0].get("name", ""))
+        self.pin_device(ip)
+        self.connect(ip)
+        return ip
 
     def get_preview_frame(self, last_seq: int) -> Tuple[int, Optional[np.ndarray]]:
         """Latest locally-adjusted frame; returns (seq, frame) where frame is
@@ -462,6 +499,17 @@ class OmniCamApp:
     def _on_rtt(self, rtt_ms: float) -> None:
         self.stats.set_rtt(rtt_ms)
 
+    def _on_beacon(self, dev: Dict[str, Any]) -> None:
+        """Beacon seen (beacon thread): persist as a known phone."""
+        ip = str(dev.get("ip", "")).strip()
+        if not ip:
+            return
+        try:
+            settings.remember_phone(ip, name=str(dev.get("name", "") or ""),
+                                    device=str(dev.get("model", "") or ""))
+        except Exception:
+            log.exception("remember_phone(beacon) failed")
+
     def _on_state(self, connected: bool, text: str) -> None:
         self._conn_text = text
         if not connected:
@@ -492,6 +540,14 @@ class OmniCamApp:
             if isinstance(sess, dict):
                 self.apply_remote_session(sess)
                 self._emit("session", {"state": self.get_session()})
+            ip = self.control.target_ip
+            if ip:
+                try:
+                    settings.remember_phone(ip, name=str(msg.get("device", "") or ""),
+                                            device=str(msg.get("ios", "") or ""))
+                    settings.set_pref("last_ip", ip)
+                except Exception:
+                    log.exception("remember_phone(welcome) failed")
             self._emit("welcome", dict(msg))
         elif kind == "session":
             state = msg.get("state")

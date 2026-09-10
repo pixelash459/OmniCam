@@ -1,6 +1,6 @@
 Package: local.omnicam.app
 Name: OmniCam
-Version: 1.1.12
+Version: 1.2.0
 Architecture: iphoneos-arm
 Description: Streams the iPhone camera over Wi-Fi to the OmniCam PC client (H.264 over RTP).
 Maintainer: OmniCam

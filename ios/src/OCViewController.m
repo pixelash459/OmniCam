@@ -22,6 +22,33 @@ typedef NS_ENUM(NSInteger, OCSliderTag) {
     OCSliderCameraZoom = 299,
 };
 
+// The filter panel scrolls vertically but is full of horizontal sliders and
+// segmented controls. A stock UIScrollView delays and then cancels the touch
+// so the slider never moves and the panel scrolls instead ("the whole menu
+// moved"). Let controls own their touches; only empty areas scroll.
+@interface OCPanelScrollView : UIScrollView
+@end
+
+@implementation OCPanelScrollView
+- (instancetype)initWithFrame:(CGRect)frame {
+    self = [super initWithFrame:frame];
+    if (self) {
+        self.delaysContentTouches = NO;
+        self.canCancelContentTouches = YES;
+    }
+    return self;
+}
+- (BOOL)touchesShouldCancelInContentView:(UIView *)view {
+    if ([view isKindOfClass:[UISlider class]] ||
+        [view isKindOfClass:[UISwitch class]] ||
+        [view isKindOfClass:[UISegmentedControl class]] ||
+        [view isKindOfClass:[UITextField class]]) {
+        return NO;
+    }
+    return [super touchesShouldCancelInContentView:view];
+}
+@end
+
 static UIColor *OCAccent(void) {
     static UIColor *c;
     static dispatch_once_t once;
@@ -402,9 +429,10 @@ static UIColor *OCAccent(void) {
     _panel.layer.masksToBounds = YES;
     [self.view addSubview:_panel];
 
-    _panelScroll = [[UIScrollView alloc] init];
+    _panelScroll = [[OCPanelScrollView alloc] initWithFrame:CGRectZero];
     _panelScroll.showsVerticalScrollIndicator = YES;
     _panelScroll.alwaysBounceVertical = YES;
+    _panelScroll.panGestureRecognizer.minimumNumberOfTouches = 1;
     [_panel addSubview:_panelScroll];
 
     CGFloat y = 10;

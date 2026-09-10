@@ -25,6 +25,7 @@ import copy
 import json
 import logging
 import random
+import select
 import socket
 import struct
 import threading
@@ -314,46 +315,143 @@ def depacketize_h264(payloads: List[bytes]) -> bytes:
 # BeaconListener (UDP 9920)
 # ---------------------------------------------------------------------------
 
+def local_ipv4_addresses() -> List[str]:
+    """Best-effort list of this host's IPv4 addresses (no loopback/APIPA).
+
+    Uses ``getaddrinfo(gethostname())`` so it needs no third-party module; on
+    Windows this returns one entry per adapter (LAN, Wi-Fi, VMware, WSL, ...).
+    """
+    out: List[str] = []
+    try:
+        infos = socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET, socket.SOCK_DGRAM)
+    except OSError:
+        infos = []
+    for info in infos:
+        ip = str(info[4][0])
+        if ip.startswith("127.") or ip.startswith("169.254.") or ip in out:
+            continue
+        out.append(ip)
+    return out
+
+
+def subnet_broadcast(ip: str, prefix: int = 24) -> Optional[str]:
+    """Directed broadcast address for ``ip`` assuming a ``/prefix`` network."""
+    try:
+        parts = [int(p) for p in ip.split(".")]
+        if len(parts) != 4 or not 0 < prefix < 32:
+            return None
+        n = (parts[0] << 24) | (parts[1] << 16) | (parts[2] << 8) | parts[3]
+        mask = (0xFFFFFFFF << (32 - prefix)) & 0xFFFFFFFF
+        b = (n & mask) | (~mask & 0xFFFFFFFF)
+        return f"{(b >> 24) & 255}.{(b >> 16) & 255}.{(b >> 8) & 255}.{b & 255}"
+    except ValueError:
+        return None
+
+
 class BeaconListener:
     """Listens for OmniCam UDP discovery beacons on ``0.0.0.0:9920``.
 
     Beacons are single-line JSON + ``\\n`` with ``magic == "OMNICAM1"`` sent
-    every second by the phone.  Devices are deduped by source IP and considered
-    offline after 3.5 s without a beacon.
+    every second by the phone to ``255.255.255.255:9920``.  Devices are deduped
+    by source IP and considered offline after :data:`BEACON_OFFLINE_S`.
+
+    Robustness (Windows multi-homed hosts):
+
+    - the socket is bound with ``SO_REUSEADDR`` **and** ``SO_BROADCAST``;
+      ``0.0.0.0`` receives both the limited broadcast and any subnet-directed
+      broadcast (``192.168.0.255``) on every adapter;
+    - if the wildcard bind fails (another process holds 9920 exclusively) we
+      fall back to one socket per adapter address;
+    - every :data:`PROBE_INTERVAL_S` a tiny ``{"t":"probe"}`` datagram is
+      broadcast to ``255.255.255.255:9920`` and each adapter's ``/24``
+      broadcast.  The phone currently never reads its beacon socket (see
+      ``OCNetManager.m setupBeacon``: send-only, ephemeral port) so nothing
+      answers today, but the probe is harmless, keeps Windows' UDP flow state
+      warm, and lets a future phone build answer with a unicast beacon.  Our
+      own probes are recognised and ignored.
+    - :meth:`diagnostics` reports bind/receive state so the UI can tell the
+      user "no beacons received for N s - check the firewall profile".
     """
 
-    def __init__(self, on_devices: Optional[Callable[[List[Dict[str, Any]]], None]] = None) -> None:
+    PROBE_INTERVAL_S = 2.0
+    PROBE_PAYLOAD = json.dumps({"magic": BEACON_MAGIC, "t": "probe", "ver": 1},
+                               separators=(",", ":")).encode("utf-8") + b"\n"
+
+    def __init__(self, on_devices: Optional[Callable[[List[Dict[str, Any]]], None]] = None,
+                 probe: bool = True) -> None:
         self._on_devices = on_devices
+        self._probe_enabled = probe
         self._devices: Dict[str, Dict[str, Any]] = {}
         self._pinned: set[str] = set()
         self._signature = ""
         self._lock = threading.Lock()
         self._stop_evt = threading.Event()
         self._thread: Optional[threading.Thread] = None
-        self._sock: Optional[socket.socket] = None
+        self._socks: List[socket.socket] = []
+        self._bind_addrs: List[str] = []
+        self._started_mono = 0.0
+        self._last_rx_mono = 0.0
+        self._rx_count = 0
+        self._probes_sent = 0
+        self._last_probe_mono = 0.0
+        self._on_beacon: Optional[Callable[[Dict[str, Any]], None]] = None
 
     # -- lifecycle ---------------------------------------------------------
+    @staticmethod
+    def _make_socket(bind_ip: str) -> socket.socket:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+            try:
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1 << 18)
+            except OSError:
+                pass
+            sock.bind((bind_ip, BEACON_PORT))
+            sock.setblocking(False)
+        except OSError:
+            sock.close()
+            raise
+        return sock
+
+    def _open_sockets(self) -> List[socket.socket]:
+        """Bind ``0.0.0.0:9920``; on failure bind each adapter address instead."""
+        try:
+            sock = self._make_socket("0.0.0.0")
+            self._bind_addrs = ["0.0.0.0"]
+            return [sock]
+        except OSError as exc:
+            log.warning("beacon bind 0.0.0.0:%d failed (%s); binding per adapter", BEACON_PORT, exc)
+        socks: List[socket.socket] = []
+        addrs: List[str] = []
+        for ip in local_ipv4_addresses():
+            try:
+                socks.append(self._make_socket(ip))
+                addrs.append(ip)
+            except OSError as exc:
+                log.warning("beacon bind %s:%d failed: %s", ip, BEACON_PORT, exc)
+        if not socks:
+            raise OSError(f"cannot bind UDP {BEACON_PORT} on any interface")
+        self._bind_addrs = addrs
+        return socks
+
     def start(self) -> None:
         """Bind UDP 9920 and start the receive thread (idempotent)."""
         if self._thread is not None:
             return
         self._stop_evt.clear()
-        self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        try:
-            self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1 << 18)
-        except OSError:
-            pass
-        self._sock.bind(("0.0.0.0", BEACON_PORT))
-        self._sock.settimeout(0.5)
+        self._socks = self._open_sockets()
+        self._started_mono = time.monotonic()
+        self._last_rx_mono = 0.0
+        log.info("beacon listener bound on %s:%d", ",".join(self._bind_addrs), BEACON_PORT)
         self._thread = threading.Thread(target=self._run, name="beacon-listener", daemon=True)
         self._thread.start()
 
     def stop(self) -> None:
-        """Close the socket and join the receive thread."""
+        """Close the socket(s) and join the receive thread."""
         self._stop_evt.set()
-        sock, self._sock = self._sock, None
-        if sock is not None:
+        socks, self._socks = self._socks, []
+        for sock in socks:
             try:
                 sock.close()
             except OSError:
@@ -361,6 +459,24 @@ class BeaconListener:
         if self._thread is not None:
             self._thread.join(timeout=2.0)
             self._thread = None
+
+    def set_beacon_callback(self, cb: Optional[Callable[[Dict[str, Any]], None]]) -> None:
+        """Register ``cb(device_dict)`` invoked for every valid beacon (any thread)."""
+        self._on_beacon = cb
+
+    def diagnostics(self) -> Dict[str, Any]:
+        """Bind/receive counters for troubleshooting discovery problems."""
+        now = time.monotonic()
+        return {
+            "bound": list(self._bind_addrs),
+            "running": self._thread is not None and self._thread.is_alive(),
+            "uptime_s": round(now - self._started_mono, 1) if self._started_mono else 0.0,
+            "beacons_received": self._rx_count,
+            "since_last_beacon_s": (round(now - self._last_rx_mono, 1)
+                                    if self._last_rx_mono else None),
+            "probes_sent": self._probes_sent,
+            "local_ips": local_ipv4_addresses(),
+        }
 
     # -- access ------------------------------------------------------------
     def pin(self, ip: str) -> None:
@@ -407,18 +523,51 @@ class BeaconListener:
 
     # -- internals ---------------------------------------------------------
     def _run(self) -> None:
-        sock = self._sock
-        assert sock is not None
+        socks = list(self._socks)
+        last_prune = time.monotonic()
         while not self._stop_evt.is_set():
             try:
-                data, addr = sock.recvfrom(4096)
-            except socket.timeout:
-                self._prune_offline()
-                continue
-            except OSError:
+                ready, _, _ = select.select(socks, [], [], 0.5)
+            except (OSError, ValueError):
                 break
-            self._handle_beacon(data, addr[0])
+            for sock in ready:
+                try:
+                    data, addr = sock.recvfrom(4096)
+                except (BlockingIOError, InterruptedError):
+                    continue
+                except OSError:
+                    ready = []
+                    break
+                self._handle_beacon(data, addr[0])
+            now = time.monotonic()
+            if now - last_prune >= 0.5:
+                last_prune = now
+                self._prune_offline()
+            if self._probe_enabled and now - self._last_probe_mono >= self.PROBE_INTERVAL_S:
+                self._last_probe_mono = now
+                self._send_probe()
         log.debug("beacon listener exited")
+
+    def _send_probe(self) -> None:
+        """Broadcast a small probe on 9920 (limited + per-adapter /24 broadcast)."""
+        socks = self._socks
+        if not socks:
+            return
+        targets = ["255.255.255.255"]
+        for ip in local_ipv4_addresses():
+            b = subnet_broadcast(ip)
+            if b and b not in targets:
+                targets.append(b)
+        sent = 0
+        for sock in socks:
+            for dst in targets:
+                try:
+                    sock.sendto(self.PROBE_PAYLOAD, (dst, BEACON_PORT))
+                    sent += 1
+                except OSError as exc:
+                    log.debug("probe to %s failed: %s", dst, exc)
+        if sent:
+            self._probes_sent += 1
 
     def _handle_beacon(self, data: bytes, ip: str) -> None:
         """Parse one beacon datagram; malformed input is logged and dropped."""
@@ -430,6 +579,10 @@ class BeaconListener:
         except (ValueError, UnicodeDecodeError):
             log.debug("malformed beacon from %s", ip)
             return
+        if msg.get("t") == "probe":
+            return  # our own (or another PC's) discovery probe, not a phone
+        self._rx_count += 1
+        self._last_rx_mono = time.monotonic()
         dev = {
             "ip": ip,
             "name": str(msg.get("name", ip)),
@@ -454,6 +607,13 @@ class BeaconListener:
             self._devices[ip] = dev
         if changed:
             self._emit()
+        cb = self._on_beacon
+        if cb is not None and (changed or self._rx_count % 10 == 1):
+            # remember_phone() hits disk: only on change or every ~10 s otherwise
+            try:
+                cb(dict(dev))
+            except Exception:
+                log.exception("on_beacon callback failed")
 
     def _prune_offline(self) -> None:
         now = time.monotonic()

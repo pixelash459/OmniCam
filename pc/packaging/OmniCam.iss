@@ -1,6 +1,6 @@
 ; OmniCam PC Windows installer (Inno Setup 6)
 #define MyAppName "OmniCam PC"
-#define MyAppVersion "1.1.12"
+#define MyAppVersion "1.2.0"
 #define MyAppPublisher "OmniCam"
 #define MyAppURL "https://github.com/pixelash459/OmniCam"
 #define MyAppExeName "OmniCam.exe"
@@ -47,7 +47,7 @@ Name: "{autodesktop}\OmniCam PC"; Filename: "{app}\{#MyAppExeName}"; WorkingDir:
 
 [Run]
 Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall delete rule name=""OmniCam PC UDP"""; Flags: runhidden skipifdoesntexist; Tasks: firewall
-Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall add rule name=""OmniCam PC UDP"" dir=in action=allow protocol=UDP localport=9920-9921 program=""{app}\{#MyAppExeName}"" profile=private,domain"; Flags: runhidden; Tasks: firewall
+Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall add rule name=""OmniCam PC UDP"" dir=in action=allow protocol=UDP localport=9920-9921 program=""{app}\{#MyAppExeName}"" profile=any"; Flags: runhidden; Tasks: firewall
 Filename: "{app}\{#MyAppExeName}"; Description: "Launch OmniCam PC now"; Flags: nowait postinstall skipifsilent
 
 [UninstallRun]
