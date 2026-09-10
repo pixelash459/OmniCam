@@ -193,9 +193,9 @@ def test_app_remembers_phone_on_welcome_and_beacon(sdir):
         assert phones[0]["device"] == "iPhone15,3"
 
         # our own probe datagrams must never register as a phone
-        app.beacons._handle_beacon(app.beacons.PROBE_PAYLOAD, "192.168.0.13")
-        assert all(p["ip"] != "192.168.0.13" for p in app.known_phones())
-        assert all(d["ip"] != "192.168.0.13" for d in app.get_devices())
+        app.beacons._handle_beacon(app.beacons.PROBE_PAYLOAD, "10.255.255.1")
+        assert all(p["ip"] != "10.255.255.1" for p in app.known_phones())
+        assert all(d["ip"] != "10.255.255.1" for d in app.get_devices())
     finally:
         app.control._target = None
         app.shutdown()
