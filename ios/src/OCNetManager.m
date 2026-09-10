@@ -24,7 +24,7 @@ const int OCVideoPort   = 9921;
 const int OCControlPort = 9923;
 
 NSString * const OCMagicString      = @"OMNICAM1";
-NSString * const OCAppVersionString = @"1.1.11";
+NSString * const OCAppVersionString = @"1.1.12";
 
 static const NSUInteger OCMaxLineBytes = 64 * 1024; // §2 max message 64 KiB
 static const double OCAbrFloorKbps = 500.0;         // §6
@@ -448,7 +448,11 @@ static NSString *ocDeviceModel(void) {
             }
         }
         if (start > 0) {
-            [_lineBuf replaceBytesInRange:NSMakeRange(0, _lineBuf.length - start) withBytes:bytes + start length:_lineBuf.length - start];
+            // Drop the consumed bytes. The old code memmove'd the tail forward but
+            // kept the buffer length, so stale bytes stayed behind the tail and
+            // every later recv replayed old hello/start/session/ping lines —
+            // the 1080<->720 flip-flop and the HUD strobes came from here.
+            [_lineBuf replaceBytesInRange:NSMakeRange(0, start) withBytes:NULL length:0];
         }
         if (n < (ssize_t)sizeof buf) break;
     }
