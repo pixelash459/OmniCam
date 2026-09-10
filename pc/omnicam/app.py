@@ -117,6 +117,7 @@ class OmniCamApp:
         self._vq: "queue.Queue[Tuple[bytes, Dict[str, Any]]]" = queue.Queue(maxsize=4)
 
         self._vdec: Optional[Any] = None   # VideoDecoder
+        self._vdec_lock = threading.Lock()
         self._streaming = False
         self._stream_lock = threading.Lock()
         self._stream_cfg: Dict[str, int] = {"w": 1280, "h": 720, "fps": 30, "kbps": 3000}
@@ -291,7 +292,13 @@ class OmniCamApp:
         self.video_rx.reset()
         self._stream_cfg = {"w": int(w), "h": int(h), "fps": int(fps), "kbps": int(kbps)}
         self.video_rx.set_fps(int(fps))
-        self._vdec = VideoDecoder()
+        with self._vdec_lock:
+            old, self._vdec = self._vdec, VideoDecoder()
+        if old is not None:
+            try:
+                old.close()
+            except Exception:
+                pass
         self._last_video_rx_mono = 0.0
         rtp_host = get_local_ip(ip)
         self._rtp_host = rtp_host
@@ -307,16 +314,17 @@ class OmniCamApp:
     def stop_stream(self) -> None:
         """Send ``stop`` and tear the decode/output pipeline down.
 
-        TCP stays up (Disconnect is ``bye``). Media feedback must stop immediately
+        TCP stays up (Disconnect is ``bye``). Always tell the phone to stop even
+        if our flag already cleared — a desynced UI used to leave the phone live
+        with both Start and Stop disabled. Media feedback must stop immediately
         or the phone keeps handling NACK/PLI and the HUD glitches.
         """
-        was = False
         with self._stream_lock:
             was = self._streaming
             self._streaming = False
-        if was:
-            self.control.send_stop()
+        self.control.send_stop()
         self.video_rx.pause_feedback()
+        self._drain_video_queue()
         self._teardown_stream()
         if was:
             self._emit("stopped", {"local": True})
@@ -421,8 +429,13 @@ class OmniCamApp:
             self._apply_started(msg)
         elif kind == "stopped":
             self.video_rx.pause_feedback()
-            self._teardown_stream()
-            self._emit("stopped", {})
+            with self._stream_lock:
+                was = self._streaming
+                self._streaming = False
+            if was:
+                self._drain_video_queue()
+                self._teardown_stream()
+                self._emit("stopped", {})
         elif kind == "camera_ok":
             self._camera = str(msg.get("id", self._camera))
             self._emit("camera_ok", dict(msg))
@@ -469,8 +482,17 @@ class OmniCamApp:
         with self._preview_lock:
             self._preview = None
 
+    def _drain_video_queue(self) -> None:
+        """Drop pending Annex-B so Stop Stream cannot decode after close."""
+        while True:
+            try:
+                self._vq.get_nowait()
+            except queue.Empty:
+                break
+
     def _teardown_decoders(self) -> None:
-        vdec, self._vdec = self._vdec, None
+        with self._vdec_lock:
+            vdec, self._vdec = self._vdec, None
         if vdec is not None:
             try:
                 vdec.close()
@@ -479,6 +501,8 @@ class OmniCamApp:
 
     def _on_video_frame(self, annexb: bytes, meta: Dict[str, Any]) -> None:
         """Frame assembly callback (video-proc thread): queue for decode."""
+        if not self._streaming:
+            return
         self._last_video_rx_mono = time.monotonic()
         self.stats.add_frame(meta.get("expected", 1), meta.get("received", 1))
         if meta.get("late"):
@@ -493,7 +517,8 @@ class OmniCamApp:
             except (queue.Empty, queue.Full):
                 pass
             self.stats.count_drop()
-            self.video_rx.force_pli("queue backlog")
+            if self._streaming:
+                self.video_rx.force_pli("queue backlog")
 
     # ------------------------------------------------------------------
     # worker threads
@@ -521,10 +546,11 @@ class OmniCamApp:
                 annexb, meta = self._vq.get(timeout=0.25)
             except queue.Empty:
                 continue
-            dec = self._vdec
-            if dec is None:
-                continue
-            frames = dec.decode(annexb)
+            with self._vdec_lock:
+                dec = self._vdec
+                if dec is None:
+                    continue
+                frames = dec.decode(annexb)
             if not frames:
                 continue
             self._last_decode_mono = time.monotonic()

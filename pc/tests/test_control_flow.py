@@ -270,3 +270,23 @@ def test_pause_feedback_clears_rtcp_target():
     rx.pause_feedback()
     assert rx._feedback_addr is None
     assert rx._media_ssrc is None
+
+
+def test_stop_stream_always_sends_stop_and_ignores_duplicate_stopped():
+    app = OmniCamApp()
+    sent = []
+    app.control.send_stop = lambda: sent.append("stop") or True
+    try:
+        app._on_message(dict(STARTED_EXACT))
+        assert app.streaming is True
+        app.stop_stream()
+        assert sent == ["stop"]
+        assert app.streaming is False
+        stopped = [k for k, _ in app.drain_events() if k == "stopped"]
+        assert len(stopped) == 1
+        app._on_message({"t": "stopped"})  # phone ack after local stop
+        assert [k for k, _ in app.drain_events() if k == "stopped"] == []
+        app.stop_stream()  # idle Stop Stream still tells the phone
+        assert sent == ["stop", "stop"]
+    finally:
+        app.shutdown()

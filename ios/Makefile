@@ -14,7 +14,7 @@
 #     (its Package:/Version: fields name the produced packages/<...>.ipa).
 #
 # Build:  make package FINALPACKAGE=1      (see scripts/build-wsl.sh)
-# Output: packages/local.omnicam.app_1.1.7.ipa  (ldid fake-signed by Theos)
+# Output: packages/local.omnicam.app_1.1.8.ipa  (ldid fake-signed by Theos)
 
 TARGET = iphone:clang:12.4:12.0
 ARCHS = arm64

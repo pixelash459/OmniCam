@@ -519,8 +519,11 @@ class MainWindow(QMainWindow):
         self._app.start_stream(w, h, fps, kbps)
 
     def _on_stop_stream(self) -> None:
-        self._btn_stop.setEnabled(False)
         self._app.stop_stream()
+        connected = self.control_connected()
+        self._btn_start.setEnabled(connected)
+        self._btn_stop.setEnabled(False)
+        self._set_status("stream stopped")
 
     def _on_camera(self, camera_id: str) -> None:
         self._app.set_camera(camera_id)
@@ -712,7 +715,10 @@ class MainWindow(QMainWindow):
             elif kind == "stopped":
                 self._btn_start.setEnabled(self.control_connected())
                 self._btn_stop.setEnabled(False)
-                self._set_status("stream stopped by phone")
+                if payload.get("local"):
+                    self._set_status("stream stopped")
+                else:
+                    self._set_status("stream stopped by phone")
             elif kind == "camera_ok":
                 self._cam_label.setText(f"camera: {payload.get('id')}")
                 self._set_status(f"camera switched to {payload.get('id')}")

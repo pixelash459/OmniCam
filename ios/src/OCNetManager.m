@@ -24,11 +24,12 @@ const int OCVideoPort   = 9921;
 const int OCControlPort = 9923;
 
 NSString * const OCMagicString      = @"OMNICAM1";
-NSString * const OCAppVersionString = @"1.1.7";
+NSString * const OCAppVersionString = @"1.1.8";
 
 static const NSUInteger OCMaxLineBytes = 64 * 1024; // §2 max message 64 KiB
 static const double OCAbrFloorKbps = 500.0;         // §6
 static void * const kOCClientQueueKey = (void *)&kOCClientQueueKey;
+static void * const kOCMediaQueueKey = (void *)&kOCMediaQueueKey;
 
 #define OC_ATOMIC_ADD(v, d) __atomic_add_fetch(&(v), (d), __ATOMIC_RELAXED)
 #define OC_ATOMIC_LOAD(v)   __atomic_load_n(&(v), __ATOMIC_RELAXED)
@@ -85,6 +86,7 @@ static NSString *ocDeviceModel(void) {
 @property (nonatomic, copy, nullable) NSString *clientAddress;
 @property (nonatomic, assign) BOOL abrAuto;
 @property (nonatomic, copy) NSString *deviceModel;
+@property (nonatomic, strong) dispatch_queue_t mediaQueue; // start/stop — never block TCP
 - (void)haltStreamLockedNotifyPC:(BOOL)notifyPC;
 @end
 
@@ -108,6 +110,8 @@ static NSString *ocDeviceModel(void) {
     _listenQueue = dispatch_queue_create("oc.net.listen", DISPATCH_QUEUE_SERIAL);
     _clientQueue = dispatch_queue_create("oc.net.client", DISPATCH_QUEUE_SERIAL);
     dispatch_queue_set_specific(_clientQueue, kOCClientQueueKey, kOCClientQueueKey, NULL);
+    _mediaQueue = dispatch_queue_create("oc.net.media", DISPATCH_QUEUE_SERIAL);
+    dispatch_queue_set_specific(_mediaQueue, kOCMediaQueueKey, kOCMediaQueueKey, NULL);
     _beaconQueue = dispatch_queue_create("oc.net.beacon", DISPATCH_QUEUE_SERIAL);
     return self;
 }
@@ -459,7 +463,13 @@ static NSString *ocDeviceModel(void) {
         NSString *ip = _clientAddress;
         _clientAddress = nil;
         _clientName = nil;
-        if (_streaming) [self stopStreaming]; // PC gone → stop the stream
+        // Never stopStreaming on this queue: encoder CompleteFrames / capture
+        // startRunning must not stall TCP (that is the Stop Stream HUD strobe).
+        self->_streaming = NO;
+        self->_destValid = NO;
+        dispatch_async(self->_mediaQueue, ^{
+            [self stopStreaming];
+        });
         id<OCNetManagerDelegate> d = _delegate;
         if (d && [d respondsToSelector:@selector(netManagerClientDidDisconnect:)]) {
             dispatch_async(dispatch_get_main_queue(), ^{
@@ -570,9 +580,16 @@ static BOOL ocTcpSendAll(int fd, const uint8_t *p, size_t left) {
     if ([t isEqualToString:@"hello"]) {
         [self handleMessageHello:m];
     } else if ([t isEqualToString:@"start"]) {
-        [self handleMessageStart:m];
+        NSDictionary *copy = [m copy];
+        dispatch_async(_mediaQueue, ^{
+            [self handleMessageStart:copy];
+        });
     } else if ([t isEqualToString:@"stop"]) {
-        [self stopStreaming]; // replies `stopped`
+        // Drop RTP immediately; pause VT off this queue so ping/bye still run.
+        _destValid = NO;
+        dispatch_async(_mediaQueue, ^{
+            [self stopStreaming]; // replies `stopped` if a stream was live
+        });
     } else if ([t isEqualToString:@"camera"]) {
         [self handleMessageCamera:m];
     } else if ([t isEqualToString:@"bitrate"]) {
@@ -833,6 +850,17 @@ static BOOL ocTcpSendAll(int fd, const uint8_t *p, size_t left) {
                            kbps:(int)kbps
                          keyint:(int)keyint
                           error:(NSError **)error {
+    if (!dispatch_get_specific(kOCMediaQueueKey)) {
+        __block BOOL ok = NO;
+        __block NSError *blockErr = nil;
+        dispatch_sync(_mediaQueue, ^{
+            ok = [self startStreamingToAddress:ip videoPort:videoPort
+                                         width:w height:h fps:fps kbps:kbps
+                                        keyint:keyint error:&blockErr];
+        });
+        if (error) *error = blockErr;
+        return ok;
+    }
     [_streamLock lock];
     BOOL ok = [self startStreamingLockedToAddress:ip videoPort:videoPort
                                             width:w height:h fps:fps kbps:kbps
@@ -975,6 +1003,12 @@ static BOOL ocTcpSendAll(int fd, const uint8_t *p, size_t left) {
 }
 
 - (void)stopStreaming {
+    if (!dispatch_get_specific(kOCMediaQueueKey)) {
+        dispatch_async(_mediaQueue, ^{
+            [self stopStreaming];
+        });
+        return;
+    }
     [_streamLock lock];
     [self haltStreamLockedNotifyPC:YES];
     [_streamLock unlock];
@@ -994,7 +1028,7 @@ static BOOL ocTcpSendAll(int fd, const uint8_t *p, size_t left) {
     // Pause only — do not Invalidate VT here. Destroying the session while
     // capture is still feeding frames crashed the phone app (and the PC then
     // saw TCP drop / reconnect strobe). Full teardown happens on next start.
-    if (wasStreaming && e) [e pauseEncoding];
+    if (e) [e pauseEncoding];
     OCPacker *pk = _packer;
     if (pk) [pk endStream];
     if (notifyPC && wasStreaming) {
