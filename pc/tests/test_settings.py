@@ -43,6 +43,32 @@ def test_load_missing_and_corrupt(sdir):
     assert settings.known_phones() == []
 
 
+def test_value_survives_transient_replace_failure(sdir, monkeypatch):
+    """Windows can briefly lock a just-written file (Defender/indexer). A
+    failed os.replace must not make the running process forget the value."""
+    calls = {"n": 0}
+    real_replace = settings.os.replace
+
+    def flaky_replace(src, dst):
+        calls["n"] += 1
+        if calls["n"] <= 2:
+            raise PermissionError("locked")
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(settings.os, "replace", flaky_replace)
+    monkeypatch.setattr(settings.time, "sleep", lambda *_: None)
+    settings.set_pref("stream.res", "1920x1080")
+    assert settings.get_pref("stream.res") == "1920x1080"
+    assert calls["n"] == 3  # retried until it went through
+
+    # Even when every attempt fails, the in-process value is kept.
+    monkeypatch.setattr(settings.os, "replace",
+                        lambda *a: (_ for _ in ()).throw(PermissionError("locked")))
+    settings.set_pref("stream.fps", 15)
+    assert settings.get_pref("stream.fps") == 15
+    assert settings.get_pref("stream.res") == "1920x1080"
+
+
 def test_save_is_atomic_and_creates_dir(sdir):
     settings.save_settings({"prefs": {"a": 1}, "phones": []})
     assert (sdir / "settings.json").exists()

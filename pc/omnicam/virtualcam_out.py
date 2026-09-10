@@ -119,10 +119,14 @@ class VirtualCamOut:
                 "pip install pyvirtualcam  -  and " + INSTALL_HINT
             ) from exc
         errors = []
+        # The decoder yields BGR24; pyvirtualcam defaults to RGB, which swapped
+        # red and blue in every app reading the virtual camera (blue skin,
+        # orange clothes). Declare the real format so OBS converts correctly.
+        fmt = pyvirtualcam.PixelFormat.BGR
         for backend in BACKENDS:
             try:
                 cam = pyvirtualcam.Camera(width=int(width), height=int(height),
-                                          fps=float(fps), backend=backend)
+                                          fps=float(fps), fmt=fmt, backend=backend)
             except Exception as exc:
                 errors.append(f"{backend}: {exc}")
                 continue

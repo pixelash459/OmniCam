@@ -2,7 +2,7 @@
 rem Build a standalone OmniCam PC tree + Inno Setup installer.
 rem Output:
 rem   pc\dist\OmniCam\OmniCam.exe     (portable onedir)
-rem   dist\OmniCam-PC-1.2.0-Setup.exe (this repo's dist\, double-click installer)
+rem   dist\OmniCam-PC-1.2.1-Setup.exe (this repo's dist\, double-click installer)
 setlocal EnableExtensions
 cd /d "%~dp0"
 
@@ -49,5 +49,5 @@ echo ==^> Inno Setup  "%ISCC%"
 echo.
 echo Done:
 echo   %~dp0dist\OmniCam\OmniCam.exe
-echo   %~dp0..\dist\OmniCam-PC-1.2.0-Setup.exe
+echo   %~dp0..\dist\OmniCam-PC-1.2.1-Setup.exe
 endlocal

@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import copy
 import json
+import copy
 import logging
 import os
 import tempfile
@@ -90,26 +91,55 @@ def _normalize(d: Any) -> Dict[str, Any]:
     return out
 
 
+# In-process copy of the last loaded/saved settings, keyed by file path.  A
+# transient disk failure (Windows briefly locks freshly written files for
+# Defender/indexing, making os.replace raise PermissionError) must never make
+# the running app forget a value it just stored.
+_cache: Optional[Dict[str, Any]] = None
+_cache_path: Optional[Path] = None
+_REPLACE_RETRIES = 5
+
+
 def load_settings() -> Dict[str, Any]:
     """Read and return the whole settings dict (empty defaults on any error)."""
+    global _cache, _cache_path
     path = settings_path()
     with _lock:
+        if _cache is not None and _cache_path == path:
+            return copy.deepcopy(_cache)
         try:
             with open(path, "r", encoding="utf-8") as fh:
                 data = json.load(fh)
         except FileNotFoundError:
-            return _empty()
+            data = _empty()
         except (OSError, ValueError) as exc:
             log.warning("settings file %s unreadable (%s); using defaults", path, exc)
-            return _empty()
-    return _normalize(data)
+            data = _empty()
+        _cache = _normalize(data)
+        _cache_path = path
+        return copy.deepcopy(_cache)
+
+
+def _replace_with_retry(tmp: str, path: Path) -> None:
+    for attempt in range(_REPLACE_RETRIES):
+        try:
+            os.replace(tmp, path)
+            return
+        except PermissionError:
+            if attempt == _REPLACE_RETRIES - 1:
+                raise
+            time.sleep(0.02 * (attempt + 1))
 
 
 def save_settings(d: Dict[str, Any]) -> None:
     """Atomically write ``d`` to the settings file (temp file + ``os.replace``)."""
+    global _cache, _cache_path
     path = settings_path()
-    payload = json.dumps(_normalize(d), indent=2, sort_keys=True)
+    normalized = _normalize(d)
+    payload = json.dumps(normalized, indent=2, sort_keys=True)
     with _lock:
+        _cache = copy.deepcopy(normalized)
+        _cache_path = path
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
             fd, tmp = tempfile.mkstemp(prefix=".settings-", suffix=".tmp", dir=str(path.parent))
@@ -118,7 +148,7 @@ def save_settings(d: Dict[str, Any]) -> None:
                     fh.write(payload)
                     fh.flush()
                     os.fsync(fh.fileno())
-                os.replace(tmp, path)
+                _replace_with_retry(tmp, path)
             except BaseException:
                 try:
                     os.unlink(tmp)
