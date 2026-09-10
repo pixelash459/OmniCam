@@ -95,6 +95,10 @@ class MainWindow(QMainWindow):
 
         self._preview_seq = 0
         self._syncing_filters = False  # guard against push loops while syncing
+        self._filter_push_timer = QTimer(self)
+        self._filter_push_timer.setSingleShot(True)
+        self._filter_push_timer.setInterval(150)
+        self._filter_push_timer.timeout.connect(self._flush_phone_filters)
         self._device_ips: Dict[int, str] = {}
 
         self._build_ui()
@@ -590,6 +594,12 @@ class MainWindow(QMainWindow):
     # phone filters tab
     # ------------------------------------------------------------------
     def _push_phone_filters(self, *_: Any) -> None:
+        """Coalesce slider drags — a flood of filter JSON stalled the phone TCP thread."""
+        if self._syncing_filters:
+            return
+        self._filter_push_timer.start()
+
+    def _flush_phone_filters(self) -> None:
         """Collect all filter controls and push the full state to the phone."""
         if self._syncing_filters:
             return

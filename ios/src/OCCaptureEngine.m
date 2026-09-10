@@ -72,6 +72,11 @@
             [self startLocked:NULL];
         }
     });
+    void (^handler)(NSString *) = self.errorHandler;
+    if (handler) {
+        NSString *msg = err.localizedDescription ?: @"camera recovered";
+        dispatch_async(dispatch_get_main_queue(), ^{ handler(msg); });
+    }
 }
 
 - (void)sessionInterruptionEnded:(NSNotification *)note {

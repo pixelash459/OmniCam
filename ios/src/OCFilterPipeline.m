@@ -39,6 +39,10 @@ static uint64_t ocNowMs(void) {
 // Preview handoff (written on renderQueue, read from MTKView's queue).
 @property (nonatomic, strong, nullable) CIImage *previewImage;
 @property (nonatomic, strong) NSLock *previewLock;
+@property (nonatomic, strong) NSLock *latestLock;
+@property (nonatomic, assign, nullable) CVPixelBufferRef latestBuf;
+@property (nonatomic, assign) CMTime latestTs;
+@property (nonatomic, assign) BOOL drainScheduled;
 
 // Destination pool for FILTERED frames, recreated when dimensions change.
 // BUG 1 FIX: its buffers carry kCVPixelBufferOpenGLESCompatibilityKey so the
@@ -111,6 +115,7 @@ static uint64_t ocNowMs(void) {
     _renderQueue = dispatch_queue_create("oc.filter.render", DISPATCH_QUEUE_SERIAL);
     _lutLoader = [[OCLutLoader alloc] init];
     _previewLock = [[NSLock alloc] init];
+    _latestLock = [[NSLock alloc] init];
     _lastRenderMs = 0;
     return self;
 }
@@ -118,6 +123,7 @@ static uint64_t ocNowMs(void) {
 - (void)dealloc {
     if (_colorSpace) CGColorSpaceRelease(_colorSpace);
     if (_ownPool) CFRelease(_ownPool);
+    if (_latestBuf) CFRelease(_latestBuf);
 }
 
 - (CIContext *)ciContext { return _ciContext; }
@@ -139,11 +145,37 @@ static uint64_t ocNowMs(void) {
 - (void)captureEngine:(OCCaptureEngine *)engine
   didOutputPixelBuffer:(CVPixelBufferRef)pixelBuffer
              timestamp:(CMTime)timestamp {
-    CFRetain(pixelBuffer); // outlives this call: we hop to the render queue
-    dispatch_async(_renderQueue, ^{
-        [self processBuffer:pixelBuffer timestamp:timestamp];
-        CFRelease(pixelBuffer);
-    });
+    (void)engine;
+    CFRetain(pixelBuffer);
+    [_latestLock lock];
+    if (_latestBuf) CFRelease(_latestBuf);
+    _latestBuf = pixelBuffer;
+    _latestTs = timestamp;
+    BOOL schedule = !_drainScheduled;
+    if (schedule) _drainScheduled = YES;
+    [_latestLock unlock];
+    if (schedule) {
+        dispatch_async(_renderQueue, ^{
+            [self drainLatestBuffers];
+        });
+    }
+}
+
+- (void)drainLatestBuffers {
+    for (;;) {
+        [_latestLock lock];
+        CVPixelBufferRef buf = _latestBuf;
+        CMTime ts = _latestTs;
+        _latestBuf = NULL;
+        if (!buf) {
+            _drainScheduled = NO;
+            [_latestLock unlock];
+            return;
+        }
+        [_latestLock unlock];
+        [self processBuffer:buf timestamp:ts];
+        CFRelease(buf);
+    }
 }
 
 - (void)processBuffer:(CVPixelBufferRef)input timestamp:(CMTime)ts {
@@ -599,6 +631,13 @@ static uint64_t ocNowMs(void) {
     if (_overlayCacheKey && _overlayImage &&
         [_overlayCacheKey isEqualToString:key] && fabs(_overlayCacheWidth - width) < 1.0) {
         return _overlayImage;
+    }
+    // UIKit bitmap APIs must run on the main thread (iOS 12 can abort otherwise).
+    if (![NSThread isMainThread]) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            (void)[self overlayImageForState:st width:width];
+        });
+        return _overlayImage; // previous cache, or nil for one frame
     }
 
     CGFloat scaleF = MAX(0.5, width / 1280.0);

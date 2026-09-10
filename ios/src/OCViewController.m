@@ -152,6 +152,16 @@ static UIColor *OCAccent(void) {
     _packer.network = _netManager;
     _packer.encoder = _encoder;
 
+    __weak typeof(self) wself = self;
+    _captureEngine.errorHandler = ^(NSString *message) {
+        __strong typeof(self) sself = wself;
+        if (!sself) return;
+        [sself->_encoder forceKeyframe];
+        dispatch_async(dispatch_get_main_queue(), ^{
+            sself->_statusLabel.text = message;
+        });
+    };
+
     _previewLayer.session = _captureEngine.session;
 }
 

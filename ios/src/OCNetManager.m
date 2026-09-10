@@ -24,7 +24,7 @@ const int OCVideoPort   = 9921;
 const int OCControlPort = 9923;
 
 NSString * const OCMagicString      = @"OMNICAM1";
-NSString * const OCAppVersionString = @"1.1.5";
+NSString * const OCAppVersionString = @"1.1.6";
 
 static const NSUInteger OCMaxLineBytes = 64 * 1024; // §2 max message 64 KiB
 static const double OCAbrFloorKbps = 500.0;         // §6
@@ -731,18 +731,18 @@ static BOOL ocTcpSendAll(int fd, const uint8_t *p, size_t left) {
         return;
     }
     _applyingRemoteFilter = YES;
-    // Main thread per OCFilterState's concurrency contract (UI sync via delegate).
-    dispatch_sync(dispatch_get_main_queue(), ^{
+    __weak typeof(self) wself = self;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        __strong typeof(self) sself = wself;
+        if (!sself) return;
         [fs loadFromDictionary:state];
+        sself->_applyingRemoteFilter = NO;
+        id<OCNetManagerDelegate> d = sself->_delegate;
+        if (d && [d respondsToSelector:@selector(netManager:didReceiveRemoteFilterState:)]) {
+            [d netManager:sself didReceiveRemoteFilterState:fs];
+        }
+        [sself sendJson:@{@"t" : @"filter_ok"}];
     });
-    _applyingRemoteFilter = NO;
-    id<OCNetManagerDelegate> d = _delegate;
-    if (d && [d respondsToSelector:@selector(netManager:didReceiveRemoteFilterState:)]) {
-        dispatch_async(dispatch_get_main_queue(), ^{
-            [d netManager:self didReceiveRemoteFilterState:fs];
-        });
-    }
-    [self sendJson:@{@"t" : @"filter_ok"}];
 }
 
 - (void)handleMessageTorch:(NSDictionary *)m {
@@ -930,10 +930,16 @@ static BOOL ocTcpSendAll(int fd, const uint8_t *p, size_t left) {
 
     if (![ce isRunning]) {
         [ce setWantsHighResolution:(w > 1280 || h > 720)];
-        if (![ce startAndReturnError:error]) return NO;
+        if (![ce startAndReturnError:error]) {
+            _destValid = NO;
+            [pk endStream];
+            return NO;
+        }
     }
 
     if (![enc startWithWidth:w height:h fps:fps bitrateKbps:kbps keyint:keyint error:error]) {
+        _destValid = NO;
+        [pk endStream];
         return NO; // encoder creation failure → log + HUD error via delegate
     }
 

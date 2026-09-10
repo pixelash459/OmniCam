@@ -423,8 +423,6 @@ class OmniCamApp:
             self._emit("stopped", {})
         elif kind == "camera_ok":
             self._camera = str(msg.get("id", self._camera))
-            if self._streaming:
-                self.request_idr()
             self._emit("camera_ok", dict(msg))
         elif kind == "bitrate_ok":
             self._emit("bitrate_ok", dict(msg))

@@ -250,7 +250,7 @@ static void OCEncodeOutputCallback(void *outputCallbackRefCon,
 
 - (void)setBitrateKbps:(int)kbps {
     if (kbps <= 0) return;
-    dispatch_sync(_vtQueue, ^{
+    dispatch_async(_vtQueue, ^{
         self->_bitrateKbps = kbps;
         if (!self->_session) return;
         OSStatus st = VTSessionSetProperty(self->_session, kVTCompressionPropertyKey_AverageBitRate,
