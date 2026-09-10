@@ -1,6 +1,6 @@
 # Contributing
 
-OmniCam is a personal, vibe-coded project. PRs are welcome if they keep the
+OmniCam is a personal project that was made public. PRs are welcome if they keep the
 phone and PC in sync and do not break the protocol.
 
 ## PC client

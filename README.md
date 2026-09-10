@@ -1,9 +1,8 @@
 # OmniCam
 
-> This was built for **personal use** on one setup (a jailbroken iPhone 6 Plus
-> on iOS 12.5.8 + a Windows PC). It is **100% vibe-coded** — written with AI
-> coding agents, not a product. Use it at your own risk; there is no promised
-> support. Pull requests are welcome.
+> Built for **personal use**, made public. I may look at issues if I am free.
+> One setup: jailbroken iPhone 6 Plus on iOS 12.5.8 + a Windows PC. Use at
+> your own risk.
 
 Turn a **jailbroken iPhone** into a wireless webcam for **Windows**. Hardware
 H.264 from the phone, RTP over Wi-Fi, a dark desktop app with a live preview,
