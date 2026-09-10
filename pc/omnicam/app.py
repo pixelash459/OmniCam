@@ -203,8 +203,12 @@ class OmniCamApp:
         return out
 
     def get_devices(self) -> List[Dict[str, Any]]:
-        """Online devices from UDP beacons (UI polls ~1 s)."""
+        """Beacon devices plus any IPs the user pinned manually."""
         return self.beacons.snapshot()
+
+    def pin_device(self, ip: str) -> None:
+        """Keep a typed IP in the device list even without UDP beacons."""
+        self.beacons.pin(ip)
 
     def get_preview_frame(self, last_seq: int) -> Tuple[int, Optional[np.ndarray]]:
         """Latest locally-adjusted frame; returns (seq, frame) where frame is
@@ -407,6 +411,7 @@ class OmniCamApp:
             self._emit("stopped", {})
         elif kind == "camera_ok":
             self._camera = str(msg.get("id", self._camera))
+            self.request_idr()
             self._emit("camera_ok", dict(msg))
         elif kind == "bitrate_ok":
             self._emit("bitrate_ok", dict(msg))

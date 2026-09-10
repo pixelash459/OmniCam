@@ -281,6 +281,7 @@ class BeaconListener:
     def __init__(self, on_devices: Optional[Callable[[List[Dict[str, Any]]], None]] = None) -> None:
         self._on_devices = on_devices
         self._devices: Dict[str, Dict[str, Any]] = {}
+        self._pinned: set[str] = set()
         self._signature = ""
         self._lock = threading.Lock()
         self._stop_evt = threading.Event()
@@ -318,14 +319,45 @@ class BeaconListener:
             self._thread = None
 
     # -- access ------------------------------------------------------------
+    def pin(self, ip: str) -> None:
+        """Keep ``ip`` in the device list even when UDP beacons never arrive."""
+        ip = ip.strip()
+        if not ip:
+            return
+        now = time.monotonic()
+        with self._lock:
+            self._pinned.add(ip)
+            old = self._devices.get(ip)
+            if old is None:
+                self._devices[ip] = {
+                    "ip": ip,
+                    "name": ip,
+                    "model": "manual",
+                    "tcp_port": CONTROL_PORT,
+                    "streaming": False,
+                    "app": "",
+                    "last_seen": now,
+                    "manual": True,
+                }
+            else:
+                old["manual"] = True
+        self._emit()
+
     def snapshot(self) -> List[Dict[str, Any]]:
-        """Return the current device list (online only), sorted by name."""
+        """Online beacons plus pinned manual IPs, sorted by name."""
         now = time.monotonic()
         out = []
         with self._lock:
+            pinned = set(self._pinned)
             for dev in self._devices.values():
-                if now - dev["last_seen"] <= DEVICE_OFFLINE_S:
-                    out.append({k: v for k, v in dev.items() if k != "last_seen"} | {"online": True})
+                ip = str(dev.get("ip", ""))
+                online = now - float(dev.get("last_seen", 0.0)) <= DEVICE_OFFLINE_S
+                if not online and ip not in pinned:
+                    continue
+                row = {k: v for k, v in dev.items() if k != "last_seen"}
+                row["online"] = online
+                row["manual"] = bool(dev.get("manual") or ip in pinned)
+                out.append(row)
         out.sort(key=lambda d: d.get("name", "").lower())
         return out
 
@@ -373,6 +405,8 @@ class BeaconListener:
                 for key in ("name", "model", "tcp_port", "streaming", "app"):
                     if old.get(key) != dev[key]:
                         changed = True
+            if ip in self._pinned or (old and old.get("manual")):
+                dev["manual"] = True
             self._devices[ip] = dev
         if changed:
             self._emit()
@@ -380,7 +414,8 @@ class BeaconListener:
     def _prune_offline(self) -> None:
         now = time.monotonic()
         with self._lock:
-            dead = [ip for ip, d in self._devices.items() if now - d["last_seen"] > DEVICE_OFFLINE_S]
+            dead = [ip for ip, d in self._devices.items()
+                    if now - d["last_seen"] > DEVICE_OFFLINE_S and ip not in self._pinned]
             for ip in dead:
                 del self._devices[ip]
                 log.info("device offline: %s", ip)

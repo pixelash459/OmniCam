@@ -133,7 +133,9 @@ class MainWindow(QMainWindow):
         manual_row = QHBoxLayout()
         self._manual_ip = QLineEdit()
         self._manual_ip.setPlaceholderText("manual IP (AP may block broadcast)")
+        self._manual_ip.returnPressed.connect(self._on_add_manual_ip)
         manual_row.addWidget(self._manual_ip, 1)
+        self._mk_button("Add", self._on_add_manual_ip, manual_row)
         dev_lay.addLayout(manual_row)
         btn_row = QHBoxLayout()
         self._btn_connect = self._mk_button("Connect", self._on_connect, btn_row)
@@ -451,19 +453,57 @@ class MainWindow(QMainWindow):
     # left panel actions
     # ------------------------------------------------------------------
     def _on_connect(self) -> None:
-        ip = self._selected_device_ip() or self._manual_ip.text().strip()
+        ip = self._manual_ip.text().strip() or self._selected_device_ip() or ""
         if not ip:
-            ip, ok = QInputDialog.getText(self, "Manual IP", "Phone IP address:")
-            if not ok or not ip.strip():
+            typed, ok = QInputDialog.getText(self, "Manual IP", "Phone IP address:")
+            if not ok or not typed.strip():
                 return
-            ip = ip.strip()
-        self._app.connect(ip)
+            ip = typed.strip()
+        parsed = self._parse_ipv4(ip)
+        if parsed is None:
+            QMessageBox.warning(self, "Manual IP", f"Not a valid IPv4 address:\n{ip}")
+            return
+        self._app.pin_device(parsed)
+        self._refresh_devices()
+        self._select_device_ip(parsed)
+        self._app.connect(parsed)
+
+    def _on_add_manual_ip(self) -> None:
+        ip = self._parse_ipv4(self._manual_ip.text())
+        if ip is None:
+            QMessageBox.warning(self, "Manual IP", "Type the phone's IPv4 address, then Add.")
+            return
+        self._app.pin_device(ip)
+        self._refresh_devices()
+        self._select_device_ip(ip)
+        self._set_status(f"added {ip} — click Connect")
+
+    @staticmethod
+    def _parse_ipv4(text: str) -> Optional[str]:
+        parts = text.strip().split(".")
+        if len(parts) != 4:
+            return None
+        try:
+            nums = [int(p) for p in parts]
+        except ValueError:
+            return None
+        if any(n < 0 or n > 255 for n in nums):
+            return None
+        return ".".join(str(n) for n in nums)
 
     def _selected_device_ip(self) -> Optional[str]:
         item = self._device_list.currentItem()
         if item is None:
             return None
-        return item.data(Qt.ItemDataRole.UserRole)
+        ip = item.data(Qt.ItemDataRole.UserRole)
+        return str(ip) if ip else None
+
+    def _select_device_ip(self, ip: str) -> None:
+        for i in range(self._device_list.count()):
+            it = self._device_list.item(i)
+            if it is not None and it.data(Qt.ItemDataRole.UserRole) == ip:
+                self._device_list.setCurrentItem(it)
+                return
 
     def _on_disconnect(self) -> None:
         self._app.disconnect()
@@ -727,10 +767,14 @@ class MainWindow(QMainWindow):
         current = self._selected_device_ip()
         labels = []
         for dev in devices:
-            label = f"{dev['name']}  [{dev.get('model', '?')}]  {dev['ip']}"
+            ip = dev["ip"]
+            if dev.get("manual") and (not dev.get("online") or dev.get("model") == "manual"):
+                label = f"{ip}  (manual)"
+            else:
+                label = f"{dev['name']}  [{dev.get('model', '?')}]  {ip}"
             if dev.get("streaming"):
                 label += "  (streaming)"
-            labels.append((label, dev["ip"]))
+            labels.append((label, ip))
         # Rebuild only when the set of rows changed — clearing every 1 s made
         # the list (and selection) strobe on flaky laptop Wi-Fi.
         existing = []

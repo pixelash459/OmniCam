@@ -242,8 +242,20 @@ def test_beacon_discovery_builds_device_list():
             assert devices_seen, "on_devices callback must fire on discovery"
         finally:
             tx.close()
-        # a device that stops beaconing goes offline after BEACON_OFFLINE_S
-        assert wait_until(lambda: listener.snapshot() == [], timeout=12.0,
-                          interval=0.2)
+        # a device that stops beaconing is dropped (other LAN phones may remain)
+        assert wait_until(
+            lambda: not any(d["ip"] == "127.0.0.1" for d in listener.snapshot()),
+            timeout=12.0, interval=0.2)
     finally:
         listener.stop()
+
+
+def test_manual_pin_stays_in_device_list_without_beacons():
+    listener = BeaconListener()
+    listener.pin("192.168.1.42")
+    snap = listener.snapshot()
+    assert len(snap) == 1
+    assert snap[0]["ip"] == "192.168.1.42"
+    assert snap[0]["manual"] is True
+    listener.pin("192.168.1.42")  # idempotent
+    assert len(listener.snapshot()) == 1

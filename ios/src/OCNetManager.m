@@ -24,7 +24,7 @@ const int OCVideoPort   = 9921;
 const int OCControlPort = 9923;
 
 NSString * const OCMagicString      = @"OMNICAM1";
-NSString * const OCAppVersionString = @"1.1.3";
+NSString * const OCAppVersionString = @"1.1.4";
 
 static const NSUInteger OCMaxLineBytes = 64 * 1024; // §2 max message 64 KiB
 static const double OCAbrFloorKbps = 500.0;         // §6
@@ -683,6 +683,10 @@ static NSString *ocDeviceModel(void) {
         return;
     }
     [ce switchToCameraId:idStr completion:^(NSString *activeId, NSError *err) {
+        if (!err) {
+            OCEncoder *enc = self->_encoder;
+            if (enc) [enc forceKeyframe];
+        }
         dispatch_async(self->_clientQueue, ^{
             if (!err) {
                 [self sendJson:@{@"t" : @"camera_ok", @"id" : activeId}]; // §2.2 after the ~150-300 ms gap
@@ -692,9 +696,7 @@ static NSString *ocDeviceModel(void) {
         });
         id<OCNetManagerDelegate> d = self->_delegate;
         if (d && [d respondsToSelector:@selector(netManager:activeCameraDidChange:)]) {
-            dispatch_async(dispatch_get_main_queue(), ^{
-                [d netManager:self activeCameraDidChange:activeId];
-            });
+            [d netManager:self activeCameraDidChange:activeId];
         }
     }];
 }

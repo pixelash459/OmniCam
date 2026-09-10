@@ -14,6 +14,7 @@
 @property (nonatomic, assign) BOOL torchOn;
 @property (nonatomic, strong) dispatch_queue_t sessionQueue; // all configuration serialized here
 @property (nonatomic, strong) dispatch_queue_t videoQueue;   // sample-buffer delegate queue
+@property (nonatomic, assign) BOOL reconfiguring;            // drop frames during input swap
 @end
 
 @implementation OCCaptureEngine
@@ -50,7 +51,36 @@
                                     @(kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange) };
     _videoOutput.alwaysDiscardsLateVideoFrames = YES; // real-time streaming over completeness
     [_videoOutput setSampleBufferDelegate:self queue:_videoQueue];
+
+    NSNotificationCenter *nc = [NSNotificationCenter defaultCenter];
+    [nc addObserver:self selector:@selector(sessionRuntimeError:)
+               name:AVCaptureSessionRuntimeErrorNotification object:_session];
+    [nc addObserver:self selector:@selector(sessionInterruptionEnded:)
+               name:AVCaptureSessionInterruptionEndedNotification object:_session];
     return self;
+}
+
+- (void)dealloc {
+    [[NSNotificationCenter defaultCenter] removeObserver:self];
+}
+
+- (void)sessionRuntimeError:(NSNotification *)note {
+    NSError *err = note.userInfo[AVCaptureSessionErrorKey];
+    NSLog(@"[OmniCam] AVCapture runtime error: %@", err);
+    dispatch_async(_sessionQueue, ^{
+        if (!self->_session.running) {
+            [self startLocked:NULL];
+        }
+    });
+}
+
+- (void)sessionInterruptionEnded:(NSNotification *)note {
+    (void)note;
+    dispatch_async(_sessionQueue, ^{
+        if (!self->_session.running) {
+            [self startLocked:NULL];
+        }
+    });
 }
 
 - (AVCaptureDevice *)deviceAtPosition:(AVCaptureDevicePosition)position {
@@ -206,7 +236,10 @@
     dispatch_async(_sessionQueue, ^{
         NSError *err = nil;
         if ([cameraId isEqualToString:self->_activeCameraId]) {
-            if (completion) completion(self->_activeCameraId, nil);
+            if (completion) {
+                NSString *active = self->_activeCameraId;
+                dispatch_async(dispatch_get_main_queue(), ^{ completion(active, nil); });
+            }
             return;
         }
         AVCaptureDeviceInput *target = [cameraId isEqualToString:@"front"] ? self->_frontInput : self->_backInput;
@@ -215,29 +248,67 @@
             err = [NSError errorWithDomain:@"OCCaptureEngine" code:3
                           userInfo:@{NSLocalizedDescriptionKey : @"Requested camera unavailable"}];
         } else if (!self->_session.running) {
-            self->_activeCameraId = cameraId;
+            self->_activeCameraId = [cameraId isEqualToString:@"front"] ? @"front" : @"back";
         } else {
-            [self->_session beginConfiguration];
-            [self->_session removeInput:current];
-            if ([self->_session canAddInput:target]) {
-                [self->_session addInput:target];
-            } else {
-                // Re-attach the previous input so the stream survives.
-                if ([self->_session canAddInput:current]) [self->_session addInput:current];
-                err = [NSError errorWithDomain:@"OCCaptureEngine" code:4
-                              userInfo:@{NSLocalizedDescriptionKey : @"Cannot add requested camera input"}];
+            // A8 front camera cannot run 1080p. Swapping inputs while the session
+            // is still on the 1080p preset throws / runtime-errors the session
+            // (HUD connect/disconnect strobe as the app recovers). Drop preset
+            // to 720p *before* removing the back camera.
+            self->_reconfiguring = YES;
+            BOOL began = NO;
+            @try {
+                BOOL wantFront = [cameraId isEqualToString:@"front"];
+                if (wantFront) self->_wantsHighResolution = NO;
+                NSString *oldId = self->_activeCameraId;
+                self->_activeCameraId = wantFront ? @"front" : @"back";
+                [self->_session beginConfiguration];
+                began = YES;
+                NSString *preset = [self desiredPreset];
+                if ([self->_session canSetSessionPreset:preset]) {
+                    self->_session.sessionPreset = preset;
+                }
+                if (current) [self->_session removeInput:current];
+                if ([self->_session canAddInput:target]) {
+                    [self->_session addInput:target];
+                    [self applyConnectionSettingsLocked];
+                    [self configureDeviceLocked:target.device];
+                } else {
+                    self->_activeCameraId = oldId;
+                    if (current && [self->_session canAddInput:current]) {
+                        [self->_session addInput:current];
+                    }
+                    NSString *fallback = [self desiredPreset];
+                    if ([self->_session canSetSessionPreset:fallback]) {
+                        self->_session.sessionPreset = fallback;
+                    }
+                    [self applyConnectionSettingsLocked];
+                    err = [NSError errorWithDomain:@"OCCaptureEngine" code:4
+                                  userInfo:@{NSLocalizedDescriptionKey : @"Cannot add requested camera input"}];
+                }
+                [self->_session commitConfiguration];
+                began = NO;
+                if (!err && wantFront) self->_torchOn = NO;
+            } @catch (NSException *ex) {
+                NSLog(@"[OmniCam] camera switch exception: %@", ex);
+                err = [NSError errorWithDomain:@"OCCaptureEngine" code:5
+                              userInfo:@{NSLocalizedDescriptionKey : ex.reason ?: @"camera switch failed"}];
+                if (began) {
+                    @try { [self->_session commitConfiguration]; } @catch (NSException *ex2) {
+                        NSLog(@"[OmniCam] camera switch commit after exception: %@", ex2);
+                    }
+                }
             }
-            [self applyConnectionSettingsLocked];
-            [self configureDeviceLocked:target.device];
-            [self->_session commitConfiguration];
-            if (!err) {
-                self->_activeCameraId = [cameraId isEqualToString:@"front"] ? @"front" : @"back";
-                // Front camera has no torch (DECISIONS.md) — state resets on switch.
-                if ([self->_activeCameraId isEqualToString:@"front"]) self->_torchOn = NO;
+            self->_reconfiguring = NO;
+            if (!self->_session.running) {
+                [self startLocked:NULL];
             }
         }
         NSLog(@"[OmniCam] camera switch -> %@ err: %@", self->_activeCameraId, err);
-        if (completion) completion(self->_activeCameraId, err);
+        if (completion) {
+            NSString *active = self->_activeCameraId;
+            NSError *doneErr = err;
+            dispatch_async(dispatch_get_main_queue(), ^{ completion(active, doneErr); });
+        }
     });
 }
 
@@ -303,6 +374,7 @@ didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
        fromConnection:(AVCaptureConnection *)connection {
     id<OCCaptureEngineDelegate> d = _delegate;
     if (!d) return;
+    if (self->_reconfiguring) return;
     CVPixelBufferRef pb = CMSampleBufferGetImageBuffer(sampleBuffer);
     if (!pb) return;
     CMTime ts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer);

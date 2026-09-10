@@ -6,5 +6,5 @@ RTP/UDP H.264 video on 9921 (NACK/PLI + optional FEC), TCP JSON control on
 Virtual Camera).  Video-only by design — see docs/PROTOCOL.md section 4.
 """
 
-__version__ = "1.1.3"
+__version__ = "1.1.4"
 __app_name__ = "OmniCam PC"

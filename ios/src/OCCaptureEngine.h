@@ -50,7 +50,7 @@ NS_ASSUME_NONNULL_BEGIN
 /// back camera is active — front caps at 720p (DECISIONS.md).
 - (void)setWantsHighResolution:(BOOL)hd;
 
-/// Instant single-session switch. Completion fires on an internal queue.
+/// Instant single-session switch. Completion fires on the main queue.
 - (void)switchToCameraId:(NSString *)cameraId
               completion:(void (^_Nullable)(NSString *activeId, NSError * _Nullable error))completion;
 
