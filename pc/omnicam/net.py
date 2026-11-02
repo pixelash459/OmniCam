@@ -49,6 +49,14 @@ PT_FEC = 100             # RTP payload type: optional XOR FEC
 RTCP_PT_NACK = 205       # Generic NACK, FMT=1
 RTCP_PT_PLI = 206        # PLI, FMT=1
 
+# DSCP AF41 (0x22 << 2): RFC 8325 maps it to the Wi-Fi WMM Video access
+# category, which contends for air time ahead of best-effort traffic.
+IP_TOS_AF41 = 0x88
+# Windows: an ICMP port-unreachable (phone app closed or restarting while we
+# NACK it) makes the next recvfrom() on this UDP socket fail with WSAECONNRESET.
+# This ioctl turns that behaviour off.
+SIO_UDP_CONNRESET = 0x9800000C
+
 RTP_CLOCK_VIDEO = 90000  # Hz
 
 BEACON_MAGIC = "OMNICAM1"
@@ -770,11 +778,24 @@ class ControlClient:
         """``session`` shared capture/encode state (PROTOCOL.md S2.3)."""
         return self._send({"t": "session", "state": state})
 
-    def send_rr(self, loss_pct: float, jitter_ms: float, max_seq: int, fps_decoded: float) -> bool:
+    def send_rr(self, loss_pct: float, jitter_ms: float, max_seq: int, fps_decoded: float,
+                qdelay_ms: Optional[float] = None) -> bool:
         """``rr`` receiver report every 500 ms while streaming (drives ABR)."""
-        return self._send({"t": "rr", "loss_pct": round(float(loss_pct), 2),
-                           "jitter_ms": round(float(jitter_ms), 2),
-                           "max_seq": int(max_seq), "fps_decoded": round(float(fps_decoded), 2)})
+        msg: Dict[str, Any] = {"t": "rr", "loss_pct": round(float(loss_pct), 2),
+                               "jitter_ms": round(float(jitter_ms), 2),
+                               "max_seq": int(max_seq), "fps_decoded": round(float(fps_decoded), 2)}
+        if qdelay_ms is not None:
+            msg["qdelay_ms"] = round(float(qdelay_ms), 1)
+        return self._send(msg)
+
+    def send_focus(self, x: float, y: float, lock: bool = False) -> bool:
+        """``focus`` at a normalized stream point (top-left origin)."""
+        return self._send({"t": "focus", "x": round(min(max(float(x), 0.0), 1.0), 4),
+                           "y": round(min(max(float(y), 0.0), 1.0), 4), "lock": bool(lock)})
+
+    def send_focus_auto(self) -> bool:
+        """``focus`` back to continuous auto focus / exposure."""
+        return self._send({"t": "focus", "auto": True})
 
     def send_ping(self) -> bool:
         """``ping`` with ms-epoch payload; the phone echoes it unchanged."""
@@ -1027,6 +1048,16 @@ class VideoReceiver:
         self._max_seq_lock = threading.Lock()
         self._last_arrival: Optional[float] = None
         self._last_ts: Optional[int] = None
+        # Queuing-delay estimate (GCC's delay signal, simplified): one-way
+        # delay of each frame's last packet relative to the smallest seen in
+        # the last QDELAY_WINDOW_S. Grows when a Wi-Fi/AP buffer fills, which
+        # happens before packets start to drop.
+        self._qd_ts0: Optional[int] = None
+        self._qd_mono0 = 0.0
+        self._qd_hist: deque[Tuple[float, float]] = deque()  # (mono, one-way delay s)
+        self._qdelay_ms = 0.0
+
+    QDELAY_WINDOW_S = 10.0
 
     # -- lifecycle ---------------------------------------------------------
     def start(self) -> None:
@@ -1043,6 +1074,15 @@ class VideoReceiver:
             self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4 << 20)
         except OSError:
             pass
+        try:  # NACK/PLI ride the same WMM class as the video they protect
+            self._sock.setsockopt(socket.IPPROTO_IP, socket.IP_TOS, IP_TOS_AF41)
+        except (OSError, AttributeError):
+            pass
+        if hasattr(self._sock, "ioctl"):  # Windows only
+            try:
+                self._sock.ioctl(SIO_UDP_CONNRESET, False)
+            except (OSError, ValueError):
+                pass
         self._sock.bind(("0.0.0.0", VIDEO_PORT))
         self._recv_thread = threading.Thread(target=self._recv_loop, name="video-recv", daemon=True)
         self._proc_thread = threading.Thread(target=self._process_loop, name="video-proc", daemon=True)
@@ -1096,6 +1136,10 @@ class VideoReceiver:
         self._last_arrival = None
         self._last_ts = None
         self._headless_ts.clear()
+        with self._stat_lock:
+            self._qd_ts0 = None
+            self._qd_hist.clear()
+            self._qdelay_ms = 0.0
         with self._stat_lock:
             self._loss_win.clear()
 
@@ -1158,8 +1202,36 @@ class VideoReceiver:
                 "fec_recovered": self._fec_recovered,
                 "dup_packets": self._dup_packets,
                 "jitter_ms": round(self._jitter_ms, 2),
+                "qdelay_ms": round(self._qdelay_ms, 1),
                 "kbps_measured": round(kbps, 1),
             }
+
+    def _note_frame_delay(self, ts: int, recv_mono: float) -> None:
+        """Update the queuing-delay estimate from a frame's last packet
+        (caller holds ``_stat_lock``)."""
+        if self._qd_ts0 is None:
+            self._qd_ts0, self._qd_mono0 = ts, recv_mono
+        rel = ((ts - self._qd_ts0) & 0xFFFFFFFF) / float(RTP_CLOCK_VIDEO)
+        delay = recv_mono - self._qd_mono0 - rel
+        if abs(delay) > 30.0:  # ts wrap / sender clock jump: start over
+            self._qd_ts0, self._qd_mono0 = ts, recv_mono
+            self._qd_hist.clear()
+            delay = 0.0
+        hist = self._qd_hist
+        hist.append((recv_mono, delay))
+        while hist and recv_mono - hist[0][0] > self.QDELAY_WINDOW_S:
+            hist.popleft()
+        base = min(d for _, d in hist)
+        q_ms = max(0.0, (delay - base) * 1000.0)
+        # Smooth over a few frames: a Wi-Fi outage releases a burst whose
+        # first packet looks late (see GCC-over-Wi-Fi), and one big IDR adds
+        # its own transmit time.
+        self._qdelay_ms += (q_ms - self._qdelay_ms) / 4.0
+
+    def get_queue_delay_ms(self) -> float:
+        """Smoothed queuing delay above the recent minimum (ms)."""
+        with self._stat_lock:
+            return round(self._qdelay_ms, 1)
 
     def get_max_seq(self) -> int:
         """Highest video RTP sequence number received (for ``rr``)."""
@@ -1173,6 +1245,10 @@ class VideoReceiver:
         while not self._stop_evt.is_set():
             try:
                 data, addr = sock.recvfrom(65535)
+            except ConnectionResetError:
+                # Belt and braces for SIO_UDP_CONNRESET: a bounced NACK used to
+                # end this loop for good, and video never came back.
+                continue
             except (socket.timeout, OSError):
                 break
             pkt = parse_rtp(data)
@@ -1261,6 +1337,8 @@ class VideoReceiver:
                     self._jitter_ms += (d * 1000.0 - self._jitter_ms) / 16.0
             self._last_arrival = now
             self._last_ts = pkt.ts
+            if marker:
+                self._note_frame_delay(ts, recv_mono)
 
         if seq in self._recent or seq in self._buffer:
             with self._stat_lock:

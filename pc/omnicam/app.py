@@ -134,6 +134,8 @@ class OmniCamApp:
         self._conn_text = "disconnected"
         self._camera_caps: Dict[str, List[int]] = {}
         self._rtp_host: Optional[str] = None   # media IP advertised in start (advisory)
+        self._phone_caps: List[str] = []       # welcome "caps" (optional features)
+        self._phone_luts: List[str] = []       # imported .cube names on the phone
 
         self._local_lock = threading.Lock()
         self._local_adjust: Dict[str, Any] = {"brightness": 0, "contrast": 0, "saturation": 100,
@@ -278,6 +280,14 @@ class OmniCamApp:
     def get_camera(self) -> str:
         """Currently selected phone camera ('front'/'back')."""
         return self._camera
+
+    def phone_supports(self, feature: str) -> bool:
+        """True when the connected phone advertised ``feature`` in ``welcome``."""
+        return feature in self._phone_caps
+
+    def get_phone_luts(self) -> List[str]:
+        """Names of the .cube LUTs imported on the phone."""
+        return list(self._phone_luts)
 
     def get_camera_caps(self) -> Dict[str, List[int]]:
         """Camera caps from ``welcome``: id -> [max_w, max_h, max_fps]."""
@@ -452,6 +462,23 @@ class OmniCamApp:
         """Force a keyframe on the phone."""
         self.control.send_idr()
 
+    def focus_at(self, x: float, y: float, lock: bool = False) -> bool:
+        """Tap-to-focus/expose at a normalized stream point (phone 1.3.0+)."""
+        if not self.phone_supports("focus"):
+            return False
+        return self.control.send_focus(x, y, lock)
+
+    def focus_auto(self) -> bool:
+        """Back to continuous auto focus / exposure (phone 1.3.0+)."""
+        if not self.phone_supports("focus"):
+            return False
+        return self.control.send_focus_auto()
+
+    def get_last_frame(self) -> Optional[np.ndarray]:
+        """Latest decoded, locally adjusted BGR frame (for snapshots)."""
+        with self._preview_lock:
+            return None if self._preview is None else self._preview.copy()
+
     def start_virtual_cam(self) -> str:
         """Open OBS Virtual Camera (Unity Capture fallback) at stream size."""
         cfg = self._stream_cfg
@@ -524,6 +551,10 @@ class OmniCamApp:
         """Route a phone->PC control message (PROTOCOL.md section 2.2)."""
         kind = msg.get("t")
         if kind == "welcome":
+            caps = msg.get("caps")
+            self._phone_caps = [str(c) for c in caps] if isinstance(caps, list) else []
+            luts = msg.get("luts")
+            self._phone_luts = [str(n) for n in luts] if isinstance(luts, list) else []
             state = msg.get("filter")
             if isinstance(state, dict):
                 self.apply_remote_filter(state)
@@ -592,6 +623,13 @@ class OmniCamApp:
             self._emit("torch_ok", dict(msg))
         elif kind == "stats":
             self.stats.set_phone(msg)
+        elif kind == "luts":
+            names = msg.get("names")
+            if isinstance(names, list):
+                self._phone_luts = [str(n) for n in names]
+                self._emit("luts", {"names": list(self._phone_luts)})
+        elif kind == "focus_ok":
+            self._emit("focus_ok", dict(msg))
         elif kind == "pong":
             pass  # RTT handled inside ControlClient
         elif kind == "error":
@@ -691,7 +729,8 @@ class OmniCamApp:
             loss = self.video_rx.get_loss_pct()
             jitter = self.video_rx.get_stats().get("jitter_ms", 0.0)
             fps_decoded = float(self.stats.snapshot().get("fps_decoded", 0.0))
-            self.control.send_rr(loss, jitter, self.video_rx.get_max_seq(), fps_decoded)
+            self.control.send_rr(loss, jitter, self.video_rx.get_max_seq(), fps_decoded,
+                                 qdelay_ms=self.video_rx.get_queue_delay_ms())
             now = time.monotonic()
             if self._last_video_rx_mono and now - self._last_video_rx_mono > 0.5:
                 self.video_rx.force_pli("decode stall")

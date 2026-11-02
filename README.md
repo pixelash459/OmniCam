@@ -25,7 +25,7 @@ No Apple developer account. The `.ipa` is `ldid` fake-signed for AppSync.
 ## End-user install (Releases)
 
 Binaries for each version live on the [Releases](https://github.com/pixelash459/OmniCam/releases) page:
-`OmniCam.ipa` and `OmniCam-PC-<ver>-Setup.exe` (current: **1.2.2**).
+`OmniCam.ipa` and `OmniCam-PC-<ver>-Setup.exe` (current: **1.3.0**).
 
 1. **Phone** — open Filza’s web server (port 2222), upload the IPA from
    `http://<phone-ip>:2222`, tap **Install**. Or copy via 3uTools / iMazing.
@@ -55,6 +55,15 @@ A copy of the IPA also sits in `dist/OmniCam.ipa` in this repo.
   LUTs, overlay) synced both ways; extra local adjust on the PC.
 - LAN discovery (UDP 9920 beacons + probes), saved-phone list, autoconnect.
 - Close-to-tray, redesigned dark UI, stats strip (fps, kbps, loss, RTT).
+- **1.3.0:** tap the phone preview (or click the PC preview) to focus/expose there,
+  long-press / right-click to lock; every phone filter is now controllable from the PC
+  (adjust, aspect, LUT picker, overlay text, timecode); PC fullscreen preview (F11 /
+  double-click) and PNG snapshots (Ctrl+S, saved to `Pictures\OmniCam`); phone battery
+  and temperature in the PC stats; **DIM** button on the phone blacks out the screen to
+  save battery and heat while streaming.
+- **1.3.0 networking:** keyframe bursts are paced (WebRTC-style), video is marked DSCP
+  AF41 (Wi-Fi WMM Video class), and ABR also reacts to Wi-Fi queuing delay reported by
+  the PC (GCC-style), so the bitrate drops before packets are lost.
 - Video only — use a separate mic in the meeting app.
 
 ## Troubleshooting

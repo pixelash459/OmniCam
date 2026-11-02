@@ -18,10 +18,12 @@ from __future__ import annotations
 import logging
 import signal
 import sys
+import time
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from PySide6.QtCore import QByteArray, Qt, QTimer, Signal
-from PySide6.QtGui import QImage, QPixmap
+from PySide6.QtCore import QByteArray, QStandardPaths, Qt, QTimer, QUrl, Signal
+from PySide6.QtGui import QDesktopServices, QImage, QKeySequence, QPixmap, QShortcut
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -50,6 +52,7 @@ from omnicam import ui_theme as T
 from omnicam.app import OmniCamApp
 from omnicam.tray import TrayIcon, load_app_icon
 from omnicam.ui_theme import app_font, make_dark_palette  # noqa: F401 (re-export)
+from omnicam.net import default_filter_state
 from omnicam.ui_widgets import FormGrid, PreviewWidget, Section, SliderRow, StatsStrip
 from omnicam.virtualcam_out import VirtualCamError
 
@@ -65,6 +68,22 @@ LOOKS = ["none", "mono", "noir", "chrome", "fade", "instant",
          "process", "transfer", "sepia", "invert", "false_color"]
 STYLIZES = ["none", "pixelate", "crystallize", "hexagonal", "twirl",
             "bulge", "bump", "soft_blur", "zoom_blur"]
+ASPECTS = ["native", "16:9", "4:3"]
+NO_LUT = "(none)"
+
+# Phone "adjust" sliders: key, title, slider lo/hi (value = slider / 100), default
+ADJUST_SLIDERS: List[Tuple[str, str, int, int, int]] = [
+    ("brightness", "Brightness", -100, 100, 0),
+    ("contrast", "Contrast", -100, 100, 0),
+    ("saturation", "Saturation", 0, 200, 100),
+    ("temperature", "Warmth", -100, 100, 0),
+    ("vibrance", "Vibrance", 0, 100, 0),
+    ("gamma", "Gamma", 20, 300, 100),
+    ("sharpness", "Sharpness", 0, 100, 0),
+    ("vignette", "Vignette", 0, 100, 0),
+]
+
+THERMAL_LABELS = {"nominal": "cool", "fair": "warm", "serious": "hot", "critical": "very hot"}
 
 RESOLUTIONS: List[Tuple[int, int]] = [(1280, 720), (1920, 1080)]
 FPSES = [30, 24, 15]
@@ -125,10 +144,12 @@ class MainWindow(QMainWindow):
         self._device_ips: Dict[int, str] = {}
         self._connect_ip: Optional[str] = None  # last IP we asked to connect to
 
+        self._preview_fullscreen = False
         self._build_ui()
         self._build_tray()
         self._restore_prefs()
         self._build_timers()
+        self._build_shortcuts()
         self._show_import_warnings()
         self._maybe_autoconnect()
 
@@ -318,6 +339,7 @@ class MainWindow(QMainWindow):
         lay.addWidget(self._section_virtual_cam())
         lay.addStretch(1)
         scroll.setWidget(panel)
+        self._sidebar = scroll
         return scroll
 
     # -- section: connection ---------------------------------------------
@@ -432,6 +454,18 @@ class MainWindow(QMainWindow):
         self._cam_label.setObjectName("muted")
         grid.add_span(self._cam_label)
         sec.add_layout(grid)
+        frow = QHBoxLayout()
+        frow.setSpacing(T.SPACE)
+        self._btn_focus_auto = self._mk_button("Auto focus", self._on_focus_auto, frow)
+        self._btn_focus_auto.setEnabled(False)
+        self._btn_focus_auto.setToolTip("Back to continuous auto focus and exposure")
+        frow.addStretch(1)
+        sec.add_layout(frow)
+        focus_hint = QLabel("Click the preview to focus there; right-click to lock focus "
+                            "and exposure. Double-click for fullscreen.")
+        focus_hint.setObjectName("muted")
+        focus_hint.setWordWrap(True)
+        sec.add(focus_hint)
         return sec
 
     # -- section: phone filters (PROTOCOL.md S5) --------------------------
@@ -449,12 +483,25 @@ class MainWindow(QMainWindow):
         self._pf_look = QComboBox()
         self._pf_look.addItems(LOOKS)
         grid.add_row("Look", self._pf_look)
+        self._pf_lut = QComboBox()
+        self._pf_lut.addItem(NO_LUT)
+        self._pf_lut.setToolTip("Colour LUTs (.cube) imported on the phone")
+        grid.add_row("LUT", self._pf_lut)
         self._pf_beauty = self._mk_slider(grid, "Beauty", 0, 100, 0, None)
         self._pf_stylize = QComboBox()
         self._pf_stylize.addItems(STYLIZES)
         grid.add_row("Stylize", self._pf_stylize)
         self._pf_amount = self._mk_slider(grid, "Amount", 0, 100, 50, None)
         sec.add_layout(grid)
+
+        adj_title = QLabel("Adjust")
+        adj_title.setObjectName("fieldLabel")
+        sec.add(adj_title)
+        agrid = FormGrid()
+        self._pf_adjust: Dict[str, QSlider] = {}
+        for key, title, lo, hi, default in ADJUST_SLIDERS:
+            self._pf_adjust[key] = self._mk_slider(agrid, title, lo, hi, default, None)
+        sec.add_layout(agrid)
 
         geo_title = QLabel("Geometry")
         geo_title.setObjectName("fieldLabel")
@@ -474,18 +521,37 @@ class MainWindow(QMainWindow):
         self._pf_rotate.addItems(["0", "90", "180", "270"])
         ggrid.add_row("Rotate", self._pf_rotate)
         self._pf_zoom = QDoubleSpinBox()
-        self._pf_zoom.setRange(1.0, 8.0)
+        self._pf_zoom.setRange(0.5, 8.0)  # PROTOCOL.md S5 geometry zoom
         self._pf_zoom.setSingleStep(0.1)
         self._pf_zoom.setDecimals(2)
         self._pf_zoom.setSuffix(" x")
         ggrid.add_row("Zoom", self._pf_zoom)
         self._pf_panx = self._mk_slider(ggrid, "Pan X", -100, 100, 0, None)
         self._pf_pany = self._mk_slider(ggrid, "Pan Y", -100, 100, 0, None)
+        self._pf_aspect = QComboBox()
+        self._pf_aspect.addItems(ASPECTS)
+        ggrid.add_row("Aspect", self._pf_aspect)
         sec.add_layout(ggrid)
+
+        ov_title = QLabel("Overlay")
+        ov_title.setObjectName("fieldLabel")
+        sec.add(ov_title)
+        ogrid = FormGrid()
+        self._pf_overlay = QLineEdit()
+        self._pf_overlay.setPlaceholderText("Text burned into the video")
+        self._pf_overlay.setMaxLength(80)
+        ogrid.add_row("Text", self._pf_overlay)
+        self._pf_timecode = QCheckBox("UTC timecode")
+        ogrid.add_span(self._pf_timecode)
+        sec.add_layout(ogrid)
+
+        self._btn_pf_reset = self._mk_button("Reset phone filters", self._on_phone_filters_reset,
+                                             sec.layout_body())
 
         # push-on-change wiring (all filter controls)
         for sig in (
             self._pf_look.currentIndexChanged,
+            self._pf_lut.currentIndexChanged,
             self._pf_beauty.valueChanged,
             self._pf_stylize.currentIndexChanged,
             self._pf_amount.valueChanged,
@@ -495,9 +561,40 @@ class MainWindow(QMainWindow):
             self._pf_zoom.valueChanged,
             self._pf_panx.valueChanged,
             self._pf_pany.valueChanged,
+            self._pf_aspect.currentIndexChanged,
+            self._pf_overlay.textChanged,
+            self._pf_timecode.toggled,
+            *(s.valueChanged for s in self._pf_adjust.values()),
         ):
             sig.connect(self._push_phone_filters)
         return sec
+
+    def _filter_widgets(self) -> List[QWidget]:
+        return [self._pf_look, self._pf_lut, self._pf_beauty, self._pf_stylize, self._pf_amount,
+                self._pf_mirror, self._pf_flipv, self._pf_rotate, self._pf_zoom,
+                self._pf_panx, self._pf_pany, self._pf_aspect, self._pf_overlay,
+                self._pf_timecode, *self._pf_adjust.values()]
+
+    def _set_lut_choices(self, names: List[str], current: Optional[str] = None) -> None:
+        """Fill the LUT combo (without pushing) and select ``current``."""
+        if current is None:
+            current = self._pf_lut.currentText()
+        self._pf_lut.blockSignals(True)
+        self._pf_lut.clear()
+        self._pf_lut.addItem(NO_LUT)
+        self._pf_lut.addItems(names)
+        if current and current != NO_LUT:
+            if self._pf_lut.findText(current) < 0:
+                self._pf_lut.addItem(current)  # selected on the phone, file list not seen yet
+            self._pf_lut.setCurrentIndex(self._pf_lut.findText(current))
+        else:
+            self._pf_lut.setCurrentIndex(0)
+        self._pf_lut.setEnabled(self._pf_lut.count() > 1)
+        self._pf_lut.blockSignals(False)
+
+    def _on_phone_filters_reset(self) -> None:
+        self._sync_phone_filters(default_filter_state())
+        self._flush_phone_filters()
 
     # -- section: local adjust (PC only) ----------------------------------
     def _section_local_adjust(self) -> QWidget:
@@ -571,16 +668,33 @@ class MainWindow(QMainWindow):
         lay.setSpacing(T.SPACE + 2)
 
         self._video_label = PreviewWidget()
+        self._video_label.focus_requested.connect(self._on_preview_focus)
+        self._video_label.fullscreen_toggled.connect(self.toggle_fullscreen_preview)
         lay.addWidget(self._video_label, 1)
+        self._center_layout = lay
 
         self._stats_strip = StatsStrip((
             ("fps_decoded", "FPS"),
             ("bitrate_kbps", "kbps"),
             ("loss_pct", "Loss"),
             ("rtt_ms", "RTT"),
+            ("qdelay_ms", "Queue"),
             ("g2g_ms", "Latency"),
             ("drops", "Dropped"),
+            ("phone_power", "Phone"),
         ))
+        q_lbl = self._stats_strip.label("qdelay_ms")
+        if q_lbl is not None:
+            q_lbl.setToolTip("Wi-Fi queuing delay above the recent minimum. The phone lowers "
+                             "its bitrate when this keeps growing, before packets are lost.")
+        self._btn_snapshot = QPushButton("Snapshot")
+        self._btn_snapshot.setToolTip("Save the current frame as PNG (Ctrl+S)")
+        self._btn_snapshot.clicked.connect(self._on_snapshot)
+        self._stats_strip.trailing.addWidget(self._btn_snapshot)
+        self._btn_fullscreen = QPushButton("Fullscreen")
+        self._btn_fullscreen.setToolTip("Fullscreen preview (F11, Esc to leave)")
+        self._btn_fullscreen.clicked.connect(self.toggle_fullscreen_preview)
+        self._stats_strip.trailing.addWidget(self._btn_fullscreen)
         self._btn_stats_details = QPushButton("Details")
         self._btn_stats_details.setCheckable(True)
         self._btn_stats_details.setProperty("toggle", True)
@@ -615,6 +729,7 @@ class MainWindow(QMainWindow):
             ("late_frames", "Late frames"),
             ("dup_packets", "Duplicate packets"),
             ("jitter_ms", "Jitter (est.) ms"),
+            ("qdelay_ms", "Queuing delay ms"),
             ("fec_recovered", "FEC recovered pkts"),
             ("fec_active", "FEC active"),
         )
@@ -625,6 +740,8 @@ class MainWindow(QMainWindow):
             ("phone_loss_pct", "Loss %"),
             ("phone_nacks", "NACKs received"),
             ("phone_sent", "Packets sent"),
+            ("phone_batt", "Battery"),
+            ("phone_thermal", "Temperature"),
         )
 
         def header(text: str, row: int, col: int) -> None:
@@ -788,6 +905,85 @@ class MainWindow(QMainWindow):
         self._stats_timer = QTimer(self)
         self._stats_timer.timeout.connect(self._refresh_stats)
         self._stats_timer.start(500)
+
+    def _build_shortcuts(self) -> None:
+        QShortcut(QKeySequence("F11"), self, activated=self.toggle_fullscreen_preview)
+        QShortcut(QKeySequence(Qt.Key.Key_Escape), self, activated=self._leave_fullscreen_preview)
+        QShortcut(QKeySequence.StandardKey.Save, self, activated=self._on_snapshot)
+
+    # ------------------------------------------------------------------
+    # preview: focus / fullscreen / snapshot
+    # ------------------------------------------------------------------
+    def _on_preview_focus(self, x: float, y: float, lock: bool) -> None:
+        if not self._app.streaming:
+            self._video_label.clear_focus_marker()
+            return
+        if not self._app.phone_supports("focus"):
+            self._video_label.clear_focus_marker()
+            self._set_status("this phone build has no remote focus (update OmniCam on the phone)")
+            return
+        self._app.focus_at(x, y, lock)
+        self._btn_focus_auto.setEnabled(True)
+
+    def _on_focus_auto(self) -> None:
+        if self._app.focus_auto():
+            self._video_label.clear_focus_marker()
+
+    def toggle_fullscreen_preview(self) -> None:
+        """Preview-only fullscreen: hide sidebar, stats and status bar."""
+        self._preview_fullscreen = not self._preview_fullscreen
+        full = self._preview_fullscreen
+        self._sidebar.setVisible(not full)
+        self._stats_strip.setVisible(not full)
+        self._stats_details.setVisible(not full and self._btn_stats_details.isChecked())
+        self.statusBar().setVisible(not full)
+        m = 0 if full else T.SPACE + 4
+        self._center_layout.setContentsMargins(m, m, m, m)
+        if full:
+            self._was_maximized = self.isMaximized()
+            self.showFullScreen()
+        elif getattr(self, "_was_maximized", False):
+            self.showMaximized()
+        else:
+            self.showNormal()
+
+    def _leave_fullscreen_preview(self) -> None:
+        if self._preview_fullscreen:
+            self.toggle_fullscreen_preview()
+
+    @staticmethod
+    def snapshot_dir() -> Path:
+        pics = QStandardPaths.writableLocation(QStandardPaths.StandardLocation.PicturesLocation)
+        return Path(pics or Path.home()) / "OmniCam"
+
+    def _on_snapshot(self) -> None:
+        frame = self._app.get_last_frame()
+        if frame is None or frame.size == 0:
+            self._set_status("no video to snapshot yet")
+            return
+        h, w = frame.shape[:2]
+        img = QImage(frame.data, w, h, w * 3, QImage.Format.Format_BGR888).copy()
+        folder = self.snapshot_dir()
+        try:
+            folder.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            QMessageBox.warning(self, "Snapshot", f"Cannot create {folder}:\n{exc}")
+            return
+        path = folder / time.strftime("OmniCam-%Y%m%d-%H%M%S.png")
+        n = 1
+        while path.exists():
+            path = folder / time.strftime(f"OmniCam-%Y%m%d-%H%M%S-{n}.png")
+            n += 1
+        if not img.save(str(path), "PNG"):
+            QMessageBox.warning(self, "Snapshot", f"Could not save {path}")
+            return
+        self._set_status(f"snapshot saved: {path}")
+        self._last_snapshot = path
+        if self._tray is not None:
+            self._tray.show_message("Snapshot saved", str(path), 2500)
+
+    def open_snapshot_folder(self) -> None:
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(self.snapshot_dir())))
 
     def _show_import_warnings(self) -> None:
         """Non-fatal message boxes for missing optional dependencies."""
@@ -1053,8 +1249,13 @@ class MainWindow(QMainWindow):
         """Collect all filter controls and push the full state to the phone."""
         if self._syncing_filters:
             return
+        lut = self._pf_lut.currentText()
         updates: Dict[str, Any] = {
             "look": self._pf_look.currentText(),
+            "lut": None if lut in ("", NO_LUT) else lut,
+            "adjust": {key: s.value() / 100.0 for key, s in self._pf_adjust.items()},
+            "overlay": {"text": self._pf_overlay.text(),
+                        "show_timecode": self._pf_timecode.isChecked()},
             "beauty": self._pf_beauty.value() / 100.0,
             "stylize": self._pf_stylize.currentText(),
             "stylize_amount": self._pf_amount.value() / 100.0,
@@ -1065,6 +1266,7 @@ class MainWindow(QMainWindow):
                 "zoom": round(float(self._pf_zoom.value()), 2),
                 "panX": self._pf_panx.value() / 100.0,
                 "panY": self._pf_pany.value() / 100.0,
+                "aspect": self._pf_aspect.currentText(),
             },
         }
         self._app.push_filter(updates)
@@ -1073,9 +1275,7 @@ class MainWindow(QMainWindow):
     def _sync_phone_filters(self, state: Dict[str, Any]) -> None:
         """Update filter controls from a phone-side state (no push)."""
         self._syncing_filters = True
-        widgets = (self._pf_look, self._pf_beauty, self._pf_stylize, self._pf_amount,
-                   self._pf_mirror, self._pf_flipv, self._pf_rotate, self._pf_zoom,
-                   self._pf_panx, self._pf_pany)
+        widgets = self._filter_widgets()
         for w in widgets:
             w.blockSignals(True)
         try:
@@ -1096,6 +1296,18 @@ class MainWindow(QMainWindow):
             self._pf_zoom.setValue(float(geo.get("zoom", 1.0)))
             self._pf_panx.setValue(int(round(float(geo.get("panX", 0.0)) * 100)))
             self._pf_pany.setValue(int(round(float(geo.get("panY", 0.0)) * 100)))
+            idx = self._pf_aspect.findText(str(geo.get("aspect", "native")))
+            self._pf_aspect.setCurrentIndex(idx if idx >= 0 else 0)
+            adj = state.get("adjust", {}) or {}
+            for key, _title, _lo, _hi, default in ADJUST_SLIDERS:
+                self._pf_adjust[key].setValue(int(round(float(adj.get(key, default / 100.0)) * 100)))
+            ov = state.get("overlay", {}) or {}
+            text = str(ov.get("text", "") or "")
+            if self._pf_overlay.text() != text:  # keep the cursor while typing
+                self._pf_overlay.setText(text)
+            self._pf_timecode.setChecked(bool(ov.get("show_timecode", False)))
+            lut = state.get("lut")
+            self._set_lut_choices(self._app.get_phone_luts(), str(lut) if lut else NO_LUT)
         except (TypeError, ValueError):
             log.exception("bad filter state from phone (ignored)")
         finally:
@@ -1147,6 +1359,8 @@ class MainWindow(QMainWindow):
                 self._btn_stop.setEnabled(streaming)
                 self._btn_front.setEnabled(connected)
                 self._btn_back.setEnabled(connected)
+                if not connected:
+                    self._btn_focus_auto.setEnabled(False)
                 self._torch_check.setEnabled(connected and self._app.get_camera() == "back")
                 if not connected:
                     self._video_label.set_placeholder("No stream",
@@ -1165,6 +1379,8 @@ class MainWindow(QMainWindow):
                     self._torch_check.setEnabled(camera == "back")
                     self._apply_camera_caps()
                 self._set_status(f"welcome from {dev} (iOS {ios})")
+                state = self._app.get_filter_state()
+                self._sync_phone_filters(state)
                 self._btn_start.setEnabled(True)
                 self._video_label.set_placeholder("Connected", "Press Start Stream")
                 self._remember_connected_phone(str(dev))
@@ -1203,6 +1419,16 @@ class MainWindow(QMainWindow):
                                  f"(auto={payload.get('auto')})")
             elif kind == "filter_ok":
                 pass  # quiet confirmation
+            elif kind == "luts":
+                self._set_lut_choices(list(payload.get("names") or []))
+                self._set_status("phone LUT list updated")
+            elif kind == "focus_ok":
+                if payload.get("auto"):
+                    self._set_status("focus: continuous auto")
+                    self._btn_focus_auto.setEnabled(False)
+                else:
+                    self._set_status("focus and exposure locked" if payload.get("locked")
+                                     else "focus set")
             elif kind == "torch_ok":
                 self._set_status(f"torch: {'on' if payload.get('on') else 'off'}")
             elif kind == "filter":
@@ -1383,7 +1609,7 @@ class MainWindow(QMainWindow):
         self._status_rtt.setText(f"RTT: {rtt:.1f} ms" if isinstance(rtt, (int, float)) else "RTT: -")
         keys = ("fps_decoded", "fps_displayed", "bitrate_kbps", "loss_pct", "rtt_ms",
                 "g2g_ms", "nacks_sent", "plis_sent", "drops", "late_frames",
-                "dup_packets", "jitter_ms", "fec_recovered", "fec_active")
+                "dup_packets", "jitter_ms", "qdelay_ms", "fec_recovered", "fec_active")
         for key in keys:
             val = snap.get(key)
             self._stat_labels[key].setText("-" if val is None else str(val))
@@ -1391,6 +1617,17 @@ class MainWindow(QMainWindow):
         for key in ("fps", "kbps", "enc_ms", "loss_pct", "nacks", "sent"):
             val = phone.get(key)
             self._stat_labels[f"phone_{key}"].setText("-" if val is None else str(val))
+        batt_text, power_text, hot = self.phone_power_text(phone)
+        self._stat_labels["phone_batt"].setText(batt_text)
+        thermal = str(phone.get("thermal") or "")
+        self._stat_labels["phone_thermal"].setText(THERMAL_LABELS.get(thermal, thermal or "-"))
+        self._stats_strip.set_value("phone_power", power_text)
+        power_lbl = self._stats_strip.label("phone_power")
+        if power_lbl is not None:
+            power_lbl.setStyleSheet(f"color: {T.WARN};" if hot else "")
+            power_lbl.setToolTip("Phone battery and temperature. A hot phone throttles "
+                                 "the encoder; lower the resolution or dim its screen."
+                                 if hot else "Phone battery and temperature")
         # slim strip
         self._stats_strip.set_value("fps_decoded", self._fmt(snap.get("fps_decoded")))
         kbps = snap.get("bitrate_kbps") or snap.get("kbps_measured")  # receiver fallback
@@ -1398,6 +1635,7 @@ class MainWindow(QMainWindow):
         self._stats_strip.set_value("loss_pct", self._fmt(snap.get("loss_pct"), " %", 2))
         self._stats_strip.set_value("rtt_ms", self._fmt(snap.get("rtt_ms"), " ms"))
         self._stats_strip.set_value("g2g_ms", self._fmt(snap.get("g2g_ms"), " ms", 0))
+        self._stats_strip.set_value("qdelay_ms", self._fmt(snap.get("qdelay_ms"), " ms", 0))
         self._stats_strip.set_value("drops", self._fmt(snap.get("drops")))
         if self._app.vcam.running:
             dims = self._app.vcam.dims
@@ -1405,6 +1643,23 @@ class MainWindow(QMainWindow):
                 self._vcam_res.setText(f"{dims[0]} x {dims[1]}")
                 self._vcam_fps.setText(str(dims[2]))
             self._vcam_sent.setText(str(self._app.vcam.frames_sent))
+
+    @staticmethod
+    def phone_power_text(phone: Dict[str, Any]) -> Tuple[str, str, bool]:
+        """(battery text, strip text, is hot) from the phone ``stats`` fields."""
+        batt = phone.get("batt")
+        thermal = str(phone.get("thermal") or "")
+        if not isinstance(batt, (int, float)) or batt < 0:
+            batt_text = "-"
+        else:
+            batt_text = f"{batt * 100:.0f}%" + (" charging" if phone.get("charging") else "")
+        hot = thermal in ("serious", "critical")
+        parts = []
+        if batt_text != "-":
+            parts.append(batt_text.replace(" charging", "+"))
+        if thermal and thermal != "nominal":
+            parts.append(THERMAL_LABELS.get(thermal, thermal))
+        return batt_text, " ".join(parts) or "-", hot
 
     def _on_stats_details_toggled(self, on: bool) -> None:
         self._stats_details.setVisible(bool(on))

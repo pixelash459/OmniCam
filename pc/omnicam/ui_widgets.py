@@ -3,7 +3,8 @@
 * :class:`Section` -- titled card with an optional collapse toggle.
 * :class:`FormGrid` -- two-column label/field grid on the 8 px grid.
 * :class:`SliderRow` -- label + slider + live value readout.
-* :class:`PreviewWidget` -- aspect-preserving video surface with placeholder.
+* :class:`PreviewWidget` -- aspect-preserving video surface with placeholder,
+  click-to-focus (``focus_requested``) and double-click fullscreen.
 * :class:`StatsStrip` -- slim key/value strip under the preview.
 """
 
@@ -11,9 +12,10 @@ from __future__ import annotations
 
 from typing import Dict, Iterable, Optional, Tuple
 
-from PySide6.QtCore import QRect, QSize, Qt, Signal
-from PySide6.QtGui import QColor, QFont, QPainter, QPixmap
+from PySide6.QtCore import QPointF, QRect, QSize, Qt, QTimer, Signal
+from PySide6.QtGui import QColor, QFont, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
+    QApplication,
     QFrame,
     QGridLayout,
     QHBoxLayout,
@@ -155,15 +157,78 @@ class SliderRow(QWidget):
 
 
 class PreviewWidget(QWidget):
-    """Video surface: dark rounded panel, frame scaled to keep aspect."""
+    """Video surface: dark rounded panel, frame scaled to keep aspect.
+
+    Click = ``focus_requested(x, y, False)`` and right-click =
+    ``focus_requested(x, y, True)`` (lock), with x/y normalized to the frame
+    (top-left origin). Double-click emits ``fullscreen_toggled``; the single
+    click is held back for the double-click interval so it does not also
+    refocus.
+    """
+
+    focus_requested = Signal(float, float, bool)
+    fullscreen_toggled = Signal()
+
+    MARKER_MS = 1400
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
         self._pixmap: Optional[QPixmap] = None
         self._placeholder = "No stream"
         self._hint = "Connect a phone and press Start Stream"
+        self._frame_rect = QRect()          # where the last frame was drawn
+        self._marker: Optional[Tuple[float, float, bool]] = None
+        self._pending_click: Optional[Tuple[float, float]] = None
+        self._click_timer = QTimer(self)
+        self._click_timer.setSingleShot(True)
+        self._click_timer.timeout.connect(self._emit_pending_click)
+        self._marker_timer = QTimer(self)
+        self._marker_timer.setSingleShot(True)
+        self._marker_timer.timeout.connect(self.clear_focus_marker)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.setMinimumSize(320, 180)
+
+    # -- focus / fullscreen input -------------------------------------------
+    def _frame_point(self, pos: QPointF) -> Optional[Tuple[float, float]]:
+        r = self._frame_rect
+        if self._pixmap is None or r.isEmpty() or not r.contains(pos.toPoint()):
+            return None
+        return ((pos.x() - r.left()) / r.width(), (pos.y() - r.top()) / r.height())
+
+    def mousePressEvent(self, event: object) -> None:  # noqa: D401 - Qt override
+        pt = self._frame_point(event.position())
+        if pt is None:
+            return super().mousePressEvent(event)
+        if event.button() == Qt.MouseButton.RightButton:
+            self._click_timer.stop()
+            self._pending_click = None
+            self.show_focus_marker(pt[0], pt[1], True)
+            self.focus_requested.emit(pt[0], pt[1], True)
+        elif event.button() == Qt.MouseButton.LeftButton:
+            self._pending_click = pt
+            self._click_timer.start(QApplication.doubleClickInterval())
+
+    def mouseDoubleClickEvent(self, event: object) -> None:  # noqa: D401 - Qt override
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._click_timer.stop()
+            self._pending_click = None
+            self.fullscreen_toggled.emit()
+
+    def _emit_pending_click(self) -> None:
+        pt, self._pending_click = self._pending_click, None
+        if pt is not None:
+            self.show_focus_marker(pt[0], pt[1], False)
+            self.focus_requested.emit(pt[0], pt[1], False)
+
+    def show_focus_marker(self, x: float, y: float, locked: bool) -> None:
+        """Draw the focus square at normalized ``(x, y)`` for a moment."""
+        self._marker = (x, y, locked)
+        self._marker_timer.start(self.MARKER_MS * (2 if locked else 1))
+        self.update()
+
+    def clear_focus_marker(self) -> None:
+        self._marker = None
+        self.update()
 
     def sizeHint(self) -> QSize:  # noqa: D401 - Qt override
         return QSize(960, 540)
@@ -215,6 +280,24 @@ class PreviewWidget(QWidget):
         y = target.top() + (target.height() - scaled.height()) // 2
         p.setRenderHint(QPainter.RenderHint.Antialiasing, False)
         p.drawPixmap(x, y, scaled)
+        self._frame_rect = QRect(x, y, scaled.width(), scaled.height())
+        if self._marker is not None:
+            mx, my, locked = self._marker
+            size = max(48, min(96, scaled.height() // 7))
+            cx = int(x + mx * scaled.width())
+            cy = int(y + my * scaled.height())
+            pen = QPen(QColor(T.ACCENT))
+            pen.setWidth(2)
+            p.setPen(pen)
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.drawRect(cx - size // 2, cy - size // 2, size, size)
+            if locked:
+                f = p.font()
+                f.setPixelSize(10)
+                f.setWeight(QFont.Weight.Bold)
+                p.setFont(f)
+                p.drawText(QRect(cx - size // 2, cy - size // 2 - 16, size, 14),
+                           Qt.AlignmentFlag.AlignCenter, "AE/AF LOCK")
         p.end()
 
 

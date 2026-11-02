@@ -5,6 +5,7 @@
 #import "OCCaptureEngine.h"
 #import "OCEncoder.h"
 #import "OCPacker.h"
+#import "OCLutLoader.h"
 
 #import <UIKit/UIKit.h>
 #import <arpa/inet.h>
@@ -25,7 +26,7 @@ const int OCVideoPort   = 9921;
 const int OCControlPort = 9923;
 
 NSString * const OCMagicString      = @"OMNICAM1";
-NSString * const OCAppVersionString = @"1.2.2";
+NSString * const OCAppVersionString = @"1.3.0";
 
 static const NSUInteger OCMaxLineBytes = 64 * 1024; // §2 max message 64 KiB
 static const double OCAbrFloorKbps = 500.0;         // §6
@@ -65,6 +66,8 @@ static NSString *ocDeviceModel(void) {
     int _fps;
     int _streamWidth, _streamHeight; // last start dims — skip stop/start flicker
     double _lastLossPct, _lastJitterMs;
+    double _lastQDelayMs;    // PC-measured queuing delay (rr qdelay_ms), -1 = not sent
+    int _delayOveruseCount;  // consecutive rr with queuing delay over the limit
     int _highLossCount;      // consecutive rr with loss > 10 % (sustained-loss IDR)
     int _fecHighCount, _fecLowCount;
     BOOL _applyingRemoteFilter; // suppress echoing a PC-pushed state back
@@ -94,6 +97,7 @@ static NSString *ocDeviceModel(void) {
 @property (nonatomic, strong) dispatch_queue_t mediaQueue; // start/stop — never block TCP
 - (void)haltStreamLockedNotifyPC:(BOOL)notifyPC;
 - (void)retargetLiveEncode;
+- (void)applyCameraSwitchTo:(NSString *)cameraId;
 - (void)applyRemoteSessionFields:(NSDictionary *)state;
 @end
 
@@ -173,6 +177,13 @@ static NSString *ocDeviceModel(void) {
                                              selector:@selector(filterStateDidChange:)
                                                  name:OCFilterStateDidChangeNotification
                                                object:nil];
+    [[NSNotificationCenter defaultCenter] addObserver:self
+                                             selector:@selector(lutsDidChange:)
+                                                 name:OCLutsDidChangeNotification
+                                               object:nil];
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [UIDevice currentDevice].batteryMonitoringEnabled = YES; // for `stats` batt
+    });
 }
 
 - (void)stopAll {
@@ -246,6 +257,12 @@ static NSString *ocDeviceModel(void) {
         setsockopt(s, SOL_SOCKET, SO_RCVBUF, &rcv, sizeof rcv);
         int snd = 1024 * 1024;
         setsockopt(s, SOL_SOCKET, SO_SNDBUF, &snd, sizeof snd);
+        // DSCP AF41: RFC 8325 maps it to the WMM Video access category, so the
+        // Wi-Fi radio contends for air time ahead of best-effort traffic.
+        int tos = 0x88;
+        if (setsockopt(s, IPPROTO_IP, IP_TOS, &tos, sizeof tos) != 0) {
+            NSLog(@"[OmniCam] IP_TOS AF41 not applied: %s", strerror(errno));
+        }
 
         self->_udpSock = s;
         int fd = s;
@@ -695,6 +712,8 @@ static BOOL ocTcpSendAll(int fd, const uint8_t *p, size_t left) {
         dispatch_async(_mediaQueue, ^{
             [self handleMessageSession:copy];
         });
+    } else if ([t isEqualToString:@"focus"]) {
+        [self handleMessageFocus:m];
     } else if ([t isEqualToString:@"rr"]) {
         [self handleMessageRr:m];
     } else if ([t isEqualToString:@"ping"]) {
@@ -723,6 +742,9 @@ static BOOL ocTcpSendAll(int fd, const uint8_t *p, size_t left) {
         @"max_back" : @[@1920, @1080, @60],
         @"session" : [self sessionDictionary],
         @"filter" : (fs ? fs.dictionaryRepresentation : @{}) ?: @{},
+        @"luts" : [OCLutLoader availableLutNames],
+        // Optional features this build understands (PCs check before sending).
+        @"caps" : @[@"focus", @"luts", @"device_status"],
     }];
     id<OCNetManagerDelegate> d = _delegate;
     if (d && [d respondsToSelector:@selector(netManagerClientDidConnect:name:)]) {
@@ -799,18 +821,14 @@ static BOOL ocTcpSendAll(int fd, const uint8_t *p, size_t left) {
         if (!err) {
             OCEncoder *enc = self->_encoder;
             if (enc) [enc forceKeyframe];
-            if (self->_streaming) {
-                dispatch_async(self->_mediaQueue, ^{ [self retargetLiveEncode]; });
-            }
-        }
-        dispatch_async(self->_clientQueue, ^{
-            if (!err) {
+            dispatch_async(self->_mediaQueue, ^{
+                [self applyCameraSwitchTo:activeId];
                 [self sendJson:@{@"t" : @"camera_ok", @"id" : activeId}]; // §2.2 after the ~150-300 ms gap
                 [self pushSessionState];
-            } else {
-                [self sendError:@"badmsg"];
-            }
-        });
+            });
+        } else {
+            [self sendError:@"badmsg"];
+        }
         id<OCNetManagerDelegate> d = self->_delegate;
         if (d && [d respondsToSelector:@selector(netManager:activeCameraDidChange:)]) {
             [d netManager:self activeCameraDidChange:activeId];
@@ -829,6 +847,7 @@ static BOOL ocTcpSendAll(int fd, const uint8_t *p, size_t left) {
     _sessionKbps = kbps;
     OCEncoder *e = _encoder;
     if (e) [e setBitrateKbps:kbps];
+    [_packer setPacingBitrateKbps:kbps fps:_fps];
     [self sendJson:@{@"t" : @"bitrate_ok", @"kbps" : @(kbps), @"auto" : @NO}];
     [self pushSessionState];
 }
@@ -882,6 +901,37 @@ static BOOL ocTcpSendAll(int fd, const uint8_t *p, size_t left) {
     }
     [ce setZoomFactor:(CGFloat)x]; // clamped to [1, activeFormat max] (§2.1 "clamped by phone")
     [self pushSessionState];
+}
+
+// {"t":"focus","x":0.3,"y":0.6,"lock":false} or {"t":"focus","auto":true}.
+- (void)handleMessageFocus:(NSDictionary *)m {
+    OCCaptureEngine *ce = _captureEngine;
+    if (!ce) {
+        [self sendError:@"badmsg"];
+        return;
+    }
+    BOOL isAuto = [self flagIn:m key:@"auto" def:NO];
+    BOOL lock = [self flagIn:m key:@"lock" def:NO];
+    CGPoint p = CGPointMake(0.5, 0.5);
+    if (isAuto) {
+        lock = NO;
+        [ce resumeContinuousFocus];
+    } else {
+        id xo = m[@"x"], yo = m[@"y"];
+        if (![xo isKindOfClass:[NSNumber class]] || ![yo isKindOfClass:[NSNumber class]]) {
+            [self sendError:@"badmsg"];
+            return;
+        }
+        p = CGPointMake(MIN(MAX([xo doubleValue], 0.0), 1.0), MIN(MAX([yo doubleValue], 0.0), 1.0));
+        [ce focusAtStreamPoint:p lock:lock];
+    }
+    [self sendJson:@{@"t" : @"focus_ok", @"auto" : @(isAuto), @"locked" : @(lock)}];
+    id<OCNetManagerDelegate> d = _delegate;
+    if (d && [d respondsToSelector:@selector(netManager:didFocusAtStreamPoint:locked:auto:)]) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [d netManager:self didFocusAtStreamPoint:p locked:lock auto:isAuto];
+        });
+    }
 }
 
 - (void)handleMessageSession:(NSDictionary *)m {
@@ -1005,6 +1055,7 @@ static BOOL ocTcpSendAll(int fd, const uint8_t *p, size_t left) {
 - (void)handleMessageRr:(NSDictionary *)m {
     _lastLossPct = [self num:m key:@"loss_pct" def:0];
     _lastJitterMs = [self num:m key:@"jitter_ms" def:0];
+    _lastQDelayMs = [self num:m key:@"qdelay_ms" def:-1]; // older PCs omit it
     if (_streaming && _abrAuto) {
         [self applyAbr];
     }
@@ -1013,14 +1064,34 @@ static BOOL ocTcpSendAll(int fd, const uint8_t *p, size_t left) {
 
 #pragma mark ABR (§6)
 
+// Delay thresholds (ms of queuing above the recent minimum, from the PC).
+// GCC treats a growing queue as overuse before any packet is lost; on Wi-Fi
+// that is the AP buffer filling. Two consecutive reports (1 s) are required
+// so a single outage burst does not cut the bitrate.
+static const double OCQDelayOveruseMs = 80.0;
+static const double OCQDelayHoldMs = 30.0;
+
 - (void)applyAbr {
     double loss = _lastLossPct;
+    double qd = _lastQDelayMs;
     int before = _currentBitrateKbps;
-    if (loss < 2.0) {
+    if (qd >= OCQDelayOveruseMs) {
+        _delayOveruseCount++;
+    } else {
+        _delayOveruseCount = 0;
+    }
+    if (loss <= 10.0 && _delayOveruseCount >= 2) {
+        _delayOveruseCount = 0;
+        _highLossCount = 0;
+        _currentBitrateKbps = (int)MAX(OCAbrFloorKbps, (double)_currentBitrateKbps * 0.85);
+        if (_currentBitrateKbps != before) {
+            NSLog(@"[OmniCam] ABR queue %.0f ms → %d kbps", qd, _currentBitrateKbps);
+        }
+    } else if (loss < 2.0 && qd < OCQDelayHoldMs) {
         _highLossCount = 0;
         _currentBitrateKbps = (int)MIN((double)_maxBitrateKbps, (double)_currentBitrateKbps * 1.05);
     } else if (loss <= 10.0) {
-        _highLossCount = 0; // hold
+        _highLossCount = 0; // hold: some loss, or the queue is building
     } else {
         _highLossCount++;
         double factor = 1.0 - 0.5 * (loss / 100.0);
@@ -1034,7 +1105,8 @@ static BOOL ocTcpSendAll(int fd, const uint8_t *p, size_t left) {
     if (_currentBitrateKbps != before) {
         OCEncoder *e = _encoder;
         if (e) [e setBitrateKbps:_currentBitrateKbps];
-        NSLog(@"[OmniCam] ABR loss %.1f%% → %d kbps", loss, _currentBitrateKbps);
+        [_packer setPacingBitrateKbps:_currentBitrateKbps fps:_fps];
+        NSLog(@"[OmniCam] ABR loss %.1f%% queue %.0f ms → %d kbps", loss, qd, _currentBitrateKbps);
     }
 }
 
@@ -1209,10 +1281,17 @@ static BOOL ocTcpSendAll(int fd, const uint8_t *p, size_t left) {
     _maxBitrateKbps = kbps; // ABR cap = configured bitrate (§6)
     _currentBitrateKbps = kbps;
     _highLossCount = 0;
+    _delayOveruseCount = 0;
+    _lastQDelayMs = -1;
     _fecHighCount = 0;
     _fecLowCount = 0;
-    _lastFrames = _lastSent = _lastResent = 0;
-    _lastBytes = 0;
+    [pk setPacingBitrateKbps:kbps fps:fps];
+    // Packer totals are cumulative for the app's lifetime; baseline them so the
+    // first `stats` after a restart is not "every frame since launch".
+    _lastFrames = pk.totalVideoFrames;
+    _lastSent = pk.totalSentPackets;
+    _lastResent = pk.totalRetransmitted;
+    _lastBytes = pk.totalSentBytes;
 
     [self sendJson:@{
         @"t" : @"started",
@@ -1317,8 +1396,26 @@ static BOOL ocTcpSendAll(int fd, const uint8_t *p, size_t left) {
 
 - (void)noteLocalCameraId:(NSString *)cid {
     NSString *idStr = cid.length ? cid : (_captureEngine.activeCameraId ?: @"back");
-    [self sendJson:@{@"t" : @"camera_ok", @"id" : idStr}];
-    [self pushSessionState];
+    dispatch_async(_mediaQueue, ^{
+        [self applyCameraSwitchTo:idStr];
+        [self sendJson:@{@"t" : @"camera_ok", @"id" : idStr}];
+        [self pushSessionState];
+    });
+}
+
+/// Runs on _mediaQueue after a camera switch. The front camera caps at 720p:
+/// a 1080p session left as-is rebuilt VT at 1920x1080 while capture delivered
+/// 1280x720, so the encoder dropped every frame and the PC froze.
+- (void)applyCameraSwitchTo:(NSString *)cameraId {
+    if ([cameraId isEqualToString:@"front"] && (_sessionW > 1280 || _sessionH > 720)) {
+        _sessionW = 1280;
+        _sessionH = 720;
+        if (_sessionKbps > 3000) {
+            _sessionKbps = 3000;
+            [self setBitrateCeilingKbps:3000];
+        }
+    }
+    if (_streaming) [self retargetLiveEncode];
 }
 
 - (void)notifyLocalResolutionHD:(BOOL)hd {
@@ -1372,6 +1469,7 @@ static BOOL ocTcpSendAll(int fd, const uint8_t *p, size_t left) {
                 return;
             }
             [p beginStream];
+            [p setPacingBitrateKbps:kbps fps:fps];
             sself->_streamWidth = w;
             sself->_streamHeight = h;
             sself->_fps = fps;
@@ -1393,11 +1491,41 @@ static BOOL ocTcpSendAll(int fd, const uint8_t *p, size_t left) {
     [self sendJson:@{@"t" : @"filter", @"state" : _filterState.dictionaryRepresentation ?: @{}}];
 }
 
+- (void)pushLutList {
+    [self sendJson:@{@"t" : @"luts", @"names" : [OCLutLoader availableLutNames]}];
+}
+
+- (void)lutsDidChange:(NSNotification *)note {
+    if (_clientSock == -1) return;
+    [self pushLutList];
+}
+
 - (void)filterStateDidChange:(NSNotification *)note {
     if (note.object != _filterState) return;
     if (_applyingRemoteFilter) return; // don't echo PC-pushed state back
     if (_clientSock == -1) return;
     [self pushFilterState];
+}
+
+#pragma mark Device status
+
++ (NSDictionary *)deviceStatus {
+    UIDevice *dev = [UIDevice currentDevice];
+    float level = dev.batteryLevel; // -1 when monitoring is off / unknown
+    UIDeviceBatteryState bs = dev.batteryState;
+    BOOL charging = (bs == UIDeviceBatteryStateCharging || bs == UIDeviceBatteryStateFull);
+    NSString *thermal = @"nominal";
+    switch ([NSProcessInfo processInfo].thermalState) {
+        case NSProcessInfoThermalStateFair:     thermal = @"fair"; break;
+        case NSProcessInfoThermalStateSerious:  thermal = @"serious"; break;
+        case NSProcessInfoThermalStateCritical: thermal = @"critical"; break;
+        default: break;
+    }
+    return @{
+        @"batt" : @(level < 0 ? -1.0 : round(level * 100.0) / 100.0),
+        @"charging" : @(charging),
+        @"thermal" : thermal,
+    };
 }
 
 #pragma mark Stats (§2.2, 1 Hz)
@@ -1429,7 +1557,7 @@ static BOOL ocTcpSendAll(int fd, const uint8_t *p, size_t left) {
         double fpsNow = (double)dFrames;
         double encMs = e ? e.lastEncodeDurationMs : 0.0;
         double loss = sself->_lastLossPct;
-        [sself sendJson:@{
+        NSMutableDictionary *stats = [@{
             @"t" : @"stats",
             @"fps" : @(round(fpsNow * 10.0) / 10.0),
             @"kbps" : @(round(kbps)),
@@ -1437,7 +1565,9 @@ static BOOL ocTcpSendAll(int fd, const uint8_t *p, size_t left) {
             @"loss_pct" : @(round(loss * 10.0) / 10.0),
             @"nacks" : @(dResent),
             @"sent" : @(dSent),
-        }];
+        } mutableCopy];
+        [stats addEntriesFromDictionary:[OCNetManager deviceStatus]];
+        [sself sendJson:stats];
         id<OCNetManagerDelegate> d = sself->_delegate;
         if (d && [d respondsToSelector:@selector(netManager:didUpdateStatsFps:kbps:encMs:lossPct:nacks:sent:)]) {
             dispatch_async(dispatch_get_main_queue(), ^{

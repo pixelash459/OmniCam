@@ -62,6 +62,21 @@ NS_ASSUME_NONNULL_BEGIN
 /// Back camera only (checks hasTorch). Returns the actually-applied state.
 - (BOOL)applyTorchOn:(BOOL)on;
 
+/// YES while focus/exposure are locked at a point (cleared by a camera switch).
+@property (nonatomic, readonly, getter=isFocusLocked) BOOL focusLocked;
+
+/// Focus + expose at a capture-device point of interest ((0,0) top-left,
+/// (1,1) bottom-right, landscape with the home button on the right). With
+/// lock, AF/AE stay at that point; otherwise they keep tracking from there.
+- (void)focusAtDevicePoint:(CGPoint)point lock:(BOOL)lock;
+
+/// Same, from a point in the delivered stream frame (normalized, top-left
+/// origin). Undoes the front camera's mirroring.
+- (void)focusAtStreamPoint:(CGPoint)point lock:(BOOL)lock;
+
+/// Back to continuous auto focus / exposure (centre-weighted).
+- (void)resumeContinuousFocus;
+
 @end
 
 NS_ASSUME_NONNULL_END

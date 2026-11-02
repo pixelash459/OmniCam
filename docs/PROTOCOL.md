@@ -48,7 +48,11 @@ PC listens on `0.0.0.0:9920`, dedupes by source IP, refreshes a device list (dev
 {"t":"torch","on":true}
 {"t":"zoom","x":2.0}                   // digital zoom 1.0..max (clamped by phone)
 {"t":"session","state":{ ... }}        // §2.3 shared session; partial keys OK
-{"t":"rr","loss_pct":0.4,"jitter_ms":3,"max_seq":12345,"fps_decoded":29.7}  // every 500 ms while streaming; drives ABR
+{"t":"rr","loss_pct":0.4,"jitter_ms":3,"max_seq":12345,"fps_decoded":29.7,
+ "qdelay_ms":12.5}                     // every 500 ms while streaming; drives ABR (§6). qdelay_ms: 1.3.0+, optional
+{"t":"focus","x":0.42,"y":0.61,"lock":false}  // 1.3.0+, only if welcome caps has "focus"; x/y normalized
+                                       // in the delivered frame, top-left origin; lock = hold AF/AE there
+{"t":"focus","auto":true}              // back to continuous auto focus / exposure
 {"t":"ping","ts":1234567890123}        // ms epoch; phone echoes unchanged
 {"t":"bye"}
 ```
@@ -81,10 +85,18 @@ working route to the PC.
 {"t":"session","state":{ ... }}        // phone-originated session change (same schema as PC→phone)
 {"t":"stats","fps":29.8,"kbps":2950,"enc_ms":9.2,"loss_pct":0.4,"nacks":12,"sent":34510}
 {"t":"pong","ts":1234567890123}
+{"t":"focus_ok","auto":false,"locked":false}   // 1.3.0+
+{"t":"luts","names":["Teal.cube"]}     // 1.3.0+, imported .cube files changed on the phone
 {"t":"error","code":"busy|badmsg|nosuch"}
 ```
 
 `stats` is sent by the phone every 1 s while streaming. `enc_ms` = last frame encode time.
+From 1.3.0 `stats` also carries `"batt"` (0..1, −1 unknown), `"charging"` (bool) and
+`"thermal"` (`nominal|fair|serious|critical`, from `NSProcessInfo.thermalState`).
+
+From 1.3.0 `welcome` also carries `"luts":[...]` (imported `.cube` names, for the PC LUT
+picker) and `"caps":["focus","luts","device_status"]`. The PC sends optional messages such
+as `focus` only when the matching cap is present (an older phone answers `nosuch`).
 
 ### 2.3 Shared session schema
 
@@ -118,6 +130,18 @@ Timestamp advances by `90000/fps` per frame; all packets of one frame share a ti
 - NAL > 1200 B → **FU-A** (type 28): indicator byte = `(NRI<<5)|28`, FU header = `(S<<7)|(E<<6)|type`. All fragments share ts, consecutive seq, marker bit on the last.
 - On every **IDR**: the first packet(s) of the access unit are one **STAP-A** (type 24) containing SPS then PPS (`16-bit length + NAL`, NRI = max of contained NALs). Marker bit on final packet of the frame (IDR or not).
 - SPS/PPS are re-sent with every IDR so a joining/recovering PC decodes immediately.
+
+### 3.1a Sender pacing and DSCP (1.3.0+)
+
+- **Pacing:** the first 3 packets of a frame go out at once; the rest are spaced at
+  `min((12+1200)·8 / (5·kbps), (1/fps)/4 / (n−3))`, i.e. about 5× the target bitrate, and never
+  more than a quarter frame interval (~8 ms at 30 fps) for the whole frame. A line-rate keyframe
+  burst overflowed AP queues; WebRTC's pacer solves the same problem the same way (at 2.5×).
+  NACK retransmits are never paced or delayed by it.
+- **DSCP:** the phone's RTP socket and the PC's feedback socket set `IP_TOS = 0x88` (AF41).
+  RFC 8325 maps AF41 to the WMM Video access category. Routers may rewrite it; it is a hint.
+- **Windows:** the PC disables `SIO_UDP_CONNRESET` on the RTP socket so an ICMP
+  port-unreachable (phone app restarting while the PC NACKs it) cannot kill the receive loop.
 
 ### 3.2 Sender retransmit cache
 
@@ -178,6 +202,14 @@ Only while `auto` (default true; `{"t":"bitrate"}` sets auto=false).
 - 2 % ≤ loss ≤ 10 % → hold
 - loss > 10 % → `bitrate ×= (1 − 0.5·loss)`, floor 500 kbps; also send IDR after sustained loss
 Defaults: 720p30 → 3000 kbps, 1080p30 → 6000 kbps.
+
+**Delay signal (1.3.0+, GCC-style):** the PC estimates the queuing delay of each frame's last
+packet as its one-way delay (arrival − RTP ts) minus the minimum over the last 10 s, smoothed
+(EWMA ¼), and reports it as `rr.qdelay_ms`. A growing queue means an AP/Wi-Fi buffer is filling
+before anything is lost. The phone then:
+- `qdelay_ms ≥ 80` in two consecutive `rr` (1 s) and loss ≤ 10 % → `bitrate ×= 0.85` (overuse)
+- `qdelay_ms ≥ 30` → no increase (hold), even with no loss
+- missing `qdelay_ms` (older PC) → loss-only behaviour above
 
 ## 7. VTCompressionSession settings (phone, verified against iOS 12.4 SDK)
 

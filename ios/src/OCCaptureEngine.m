@@ -12,6 +12,7 @@
 @property (nonatomic, assign) BOOL wantsHighResolution;
 @property (nonatomic, assign) CGFloat zoomFactor;
 @property (nonatomic, assign) BOOL torchOn;
+@property (nonatomic, assign, getter=isFocusLocked) BOOL focusLocked;
 @property (nonatomic, strong) dispatch_queue_t sessionQueue; // all configuration serialized here
 @property (nonatomic, strong) dispatch_queue_t videoQueue;   // sample-buffer delegate queue
 @property (nonatomic, assign) BOOL reconfiguring;            // drop frames during input swap
@@ -239,6 +240,7 @@
     if ([device isFocusModeSupported:AVCaptureFocusModeContinuousAutoFocus]) {
         device.focusMode = AVCaptureFocusModeContinuousAutoFocus;
     }
+    _focusLocked = NO; // new device starts on continuous AF/AE
     if ([device isExposureModeSupported:AVCaptureExposureModeContinuousAutoExposure]) {
         device.exposureMode = AVCaptureExposureModeContinuousAutoExposure;
     }
@@ -377,6 +379,61 @@
         z = MIN(input.device.activeFormat.videoMaxZoomFactor, 16.0);
     });
     return z;
+}
+
+#pragma mark Focus / exposure
+
+- (void)focusAtDevicePoint:(CGPoint)point lock:(BOOL)lock {
+    CGPoint p = CGPointMake(MIN(MAX(point.x, 0.0), 1.0), MIN(MAX(point.y, 0.0), 1.0));
+    dispatch_async(_sessionQueue, ^{
+        AVCaptureDevice *dev = [self activeInput].device;
+        NSError *err = nil;
+        if (!dev || ![dev lockForConfiguration:&err]) {
+            NSLog(@"[OmniCam] focus: lockForConfiguration failed: %@", err);
+            return;
+        }
+        AVCaptureFocusMode fm = lock ? AVCaptureFocusModeAutoFocus : AVCaptureFocusModeContinuousAutoFocus;
+        if (dev.focusPointOfInterestSupported && [dev isFocusModeSupported:fm]) {
+            dev.focusPointOfInterest = p;
+            dev.focusMode = fm; // AutoFocus = focus once there, then hold
+        }
+        AVCaptureExposureMode em = lock ? AVCaptureExposureModeAutoExpose : AVCaptureExposureModeContinuousAutoExposure;
+        if (dev.exposurePointOfInterestSupported && [dev isExposureModeSupported:em]) {
+            dev.exposurePointOfInterest = p;
+            dev.exposureMode = em;
+        }
+        // Unlocked taps keep tracking the subject; locked ones must not drift.
+        dev.subjectAreaChangeMonitoringEnabled = NO;
+        [dev unlockForConfiguration];
+        self->_focusLocked = lock;
+        NSLog(@"[OmniCam] focus %@ at (%.2f, %.2f)", lock ? @"locked" : @"set", p.x, p.y);
+    });
+}
+
+- (void)focusAtStreamPoint:(CGPoint)point lock:(BOOL)lock {
+    // The stream is LandscapeRight, which is the device POI frame; the front
+    // camera's stream is mirrored, so flip x back.
+    if ([_activeCameraId isEqualToString:@"front"]) point.x = 1.0 - point.x;
+    [self focusAtDevicePoint:point lock:lock];
+}
+
+- (void)resumeContinuousFocus {
+    dispatch_async(_sessionQueue, ^{
+        AVCaptureDevice *dev = [self activeInput].device;
+        if (!dev || ![dev lockForConfiguration:nil]) return;
+        CGPoint centre = CGPointMake(0.5, 0.5);
+        if (dev.focusPointOfInterestSupported) dev.focusPointOfInterest = centre;
+        if ([dev isFocusModeSupported:AVCaptureFocusModeContinuousAutoFocus]) {
+            dev.focusMode = AVCaptureFocusModeContinuousAutoFocus;
+        }
+        if (dev.exposurePointOfInterestSupported) dev.exposurePointOfInterest = centre;
+        if ([dev isExposureModeSupported:AVCaptureExposureModeContinuousAutoExposure]) {
+            dev.exposureMode = AVCaptureExposureModeContinuousAutoExposure;
+        }
+        [dev unlockForConfiguration];
+        self->_focusLocked = NO;
+        NSLog(@"[OmniCam] focus back to continuous");
+    });
 }
 
 - (CGFloat)zoomFactor { return _zoomFactor; }

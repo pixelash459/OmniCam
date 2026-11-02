@@ -34,6 +34,9 @@ FOUNDATION_EXPORT const NSUInteger OCNackCacheSlots;  // 2048
 @property (nonatomic, readonly, getter=isFecEnabled) BOOL fecEnabled;
 
 /// Randomizes SSRCs/seqs and clears the retransmit cache. Call when a stream starts.
+/// Target bitrate + frame rate for the send pacer (0 disables pacing).
+- (void)setPacingBitrateKbps:(int)kbps fps:(int)fps;
+
 - (void)beginStream;
 - (void)endStream;
 - (void)setFecEnabled:(BOOL)on;

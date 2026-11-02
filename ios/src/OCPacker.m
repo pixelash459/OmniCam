@@ -15,6 +15,11 @@ const NSUInteger OCNackCacheSlots = 2048;
 static const uint64_t OCCacheMaxAgeMs = 2000;   // §3.2: ≥ 2 s of datagrams
 static const uint64_t OCResendMinGapMs = 10;    // flood guard for repeated NACKs
 static const int OCFecGroupSize = 4;            // §3.4
+// Pacing (WebRTC-style): spread a frame's packets at ~5x the target bitrate
+// instead of one line-rate burst, which overflows AP queues on keyframes.
+// Capped at a quarter frame interval so pacing never adds more than ~8 ms.
+static const double OCPacingFactor = 5.0;
+static const NSUInteger OCPacingFreePackets = 3; // first packets go out at once
 
 #define OC_ATOMIC_ADD(v, d) __atomic_add_fetch(&(v), (d), __ATOMIC_RELAXED)
 #define OC_ATOMIC_LOAD(v)   __atomic_load_n(&(v), __ATOMIC_RELAXED)
@@ -45,6 +50,8 @@ typedef struct {
     uint32_t _sentTotal;
     uint32_t _resentTotal;
     uint64_t _bytesTotal;
+    int _pacingKbps;
+    int _pacingFps;
 }
 @property (nonatomic, assign) uint32_t ssrcVideo;
 @property (nonatomic, assign) uint32_t ssrcFEC;
@@ -105,6 +112,11 @@ typedef struct {
 }
 
 - (BOOL)isFecEnabled { return _fecEnabled; }
+
+- (void)setPacingBitrateKbps:(int)kbps fps:(int)fps {
+    __atomic_store_n(&_pacingKbps, kbps, __ATOMIC_RELAXED);
+    __atomic_store_n(&_pacingFps, fps, __ATOMIC_RELAXED);
+}
 
 - (uint32_t)totalVideoFrames { return OC_ATOMIC_LOAD(_framesTotal); }
 - (uint32_t)totalSentPackets { return OC_ATOMIC_LOAD(_sentTotal); }
@@ -233,16 +245,42 @@ static inline void ocSetMarker(NSMutableData *pkt) {
     }
     ocSetMarker(packets.lastObject); // marker on the final packet of the frame
 
+    // Cache (and build FEC) under the lock, but send outside it: the pacer
+    // sleeps between packets and NACK retransmits must not wait on that.
+    NSMutableArray<NSData *> *outgoing = [NSMutableArray arrayWithCapacity:packets.count + 2];
     for (NSMutableData *pkt in packets) {
-        [self cacheAndSendLocked:pkt via:net];
+        [self cacheLocked:pkt outgoing:outgoing];
     }
     [_cacheLock unlock];
 
+    [self sendPaced:outgoing via:net];
     OC_ATOMIC_ADD(_framesTotal, 1);
 }
 
-// Caller holds _cacheLock.
-- (void)cacheAndSendLocked:(NSData *)pkt via:(OCNetManager *)net {
+// Runs on the encoder callback queue, one frame at a time.
+- (void)sendPaced:(NSArray<NSData *> *)outgoing via:(OCNetManager *)net {
+    NSUInteger n = outgoing.count;
+    int kbps = __atomic_load_n(&_pacingKbps, __ATOMIC_RELAXED);
+    int fps = __atomic_load_n(&_pacingFps, __ATOMIC_RELAXED);
+    useconds_t gapUs = 0;
+    if (n > OCPacingFreePackets && kbps > 0 && fps > 0) {
+        double perPacketUs = (12.0 + OCRTPMaxVideoPayload) * 8.0 * 1000.0 / (OCPacingFactor * kbps);
+        double windowUs = 1e6 / fps / 4.0;
+        double spread = n - OCPacingFreePackets;
+        gapUs = (useconds_t)MIN(perPacketUs, windowUs / spread);
+        if (gapUs < 50) gapUs = 0; // below usleep's useful resolution
+    }
+    for (NSUInteger i = 0; i < n; i++) {
+        if (gapUs && i >= OCPacingFreePackets) usleep(gapUs);
+        NSData *pkt = outgoing[i];
+        [net sendVideoDatagram:pkt];
+        OC_ATOMIC_ADD(_bytesTotal, (uint64_t)pkt.length);
+    }
+}
+
+// Caller holds _cacheLock. Appends the datagram (and any finished FEC packet)
+// to outgoing; nothing is sent here.
+- (void)cacheLocked:(NSData *)pkt outgoing:(NSMutableArray<NSData *> *)outgoing {
     const uint8_t *b = pkt.bytes;
     uint16_t seq = (uint16_t)((b[2] << 8) | b[3]);
     uint32_t ts = ((uint32_t)b[4] << 24) | ((uint32_t)b[5] << 16) | ((uint32_t)b[6] << 8) | b[7];
@@ -252,9 +290,8 @@ static inline void ocSetMarker(NSMutableData *pkt) {
     slot->addedMs = ocNowMs();
     slot->lastResendMs = 0;
 
-    [net sendVideoDatagram:pkt];
+    [outgoing addObject:pkt];
     OC_ATOMIC_ADD(_sentTotal, 1);
-    OC_ATOMIC_ADD(_bytesTotal, (uint64_t)pkt.length);
 
     if (_fecEnabled) {
         NSData *payload = [pkt subdataWithRange:NSMakeRange(12, pkt.length - 12)];
@@ -263,13 +300,13 @@ static inline void ocSetMarker(NSMutableData *pkt) {
         _fecGroup[_fecCount].payload = payload;
         _fecCount++;
         if (_fecCount == OCFecGroupSize) {
-            [self emitFecLocked:net];
+            [outgoing addObject:[self buildFecLocked]];
         }
     }
 }
 
 // §3.4: [base_seq u16][count u8][flags u8][XOR of payloads zero-padded to max length].
-- (void)emitFecLocked:(OCNetManager *)net {
+- (NSData *)buildFecLocked {
     NSUInteger maxLen = 0;
     for (int i = 0; i < _fecCount; i++) maxLen = MAX(maxLen, _fecGroup[i].payload.length);
     NSMutableData *payload = [NSMutableData dataWithLength:4 + maxLen];
@@ -286,9 +323,8 @@ static inline void ocSetMarker(NSMutableData *pkt) {
     }
     uint32_t ts = _fecGroup[_fecCount - 1].ts; // ts of last covered packet
     NSMutableData *pkt = ocRtpPacket(OCRTPPayloadTypeFEC, NO, _seqFEC++, ts, _ssrcFEC, payload.bytes, payload.length);
-    [net sendVideoDatagram:pkt];
-    OC_ATOMIC_ADD(_bytesTotal, (uint64_t)pkt.length);
     [self clearFecGroupLocked];
+    return pkt;
 }
 
 - (void)clearFecGroupLocked {

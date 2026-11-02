@@ -470,9 +470,12 @@ def test_phone_filter_push_debounced_and_structured(qapp, win):
     pushes = [c for c in win.calls if c[0] == "push_filter"]
     assert len(pushes) == 1
     assert pushes[0][1][0] == {
-        "look": "sepia", "beauty": 0.4, "stylize": "twirl", "stylize_amount": 0.75,
+        "look": "sepia", "lut": None, "beauty": 0.4, "stylize": "twirl", "stylize_amount": 0.75,
+        "adjust": {"brightness": 0.0, "contrast": 0.0, "saturation": 1.0, "temperature": 0.0,
+                   "vibrance": 0.0, "gamma": 1.0, "sharpness": 0.0, "vignette": 0.0},
+        "overlay": {"text": "", "show_timecode": False},
         "geometry": {"mirror": True, "flipV": False, "rotate": 180, "zoom": 1.5,
-                     "panX": -0.2, "panY": 0.1},
+                     "panX": -0.2, "panY": 0.1, "aspect": "native"},
     }
     assert "filter pushed: look=sepia stylize=twirl" == win._status_msg.text()
 

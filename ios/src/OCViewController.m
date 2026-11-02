@@ -60,7 +60,8 @@ static UIColor *OCAccent(void) {
                                 OCFilterPipelinePreviewDelegate,
                                 MTKViewDelegate,
                                 UITextFieldDelegate,
-                                UIDocumentPickerDelegate>
+                                UIDocumentPickerDelegate,
+                                UIGestureRecognizerDelegate>
 // Engine graph (strong — the VC owns everything).
 @property (nonatomic, strong, readwrite) OCFilterState *filterState;
 @property (nonatomic, strong) OCCaptureEngine *captureEngine;
@@ -89,6 +90,15 @@ static UIColor *OCAccent(void) {
 @property (nonatomic, strong) UILabel *zoomValueLabel;
 @property (nonatomic, strong) UISlider *cameraZoomSlider;
 @property (nonatomic, strong) UIButton *panelToggleButton;
+@property (nonatomic, strong) UIButton *dimButton;
+
+// Tap-to-focus indicator and the battery-saving dim cover.
+@property (nonatomic, strong) UIView *focusSquare;
+@property (nonatomic, strong) UILabel *focusLockLabel;
+@property (nonatomic, strong) UIView *dimCover;
+@property (nonatomic, strong) UILabel *dimLabel;
+@property (nonatomic, assign) CGFloat brightnessBeforeDim;
+@property (nonatomic, strong, nullable) NSTimer *deviceStatusTimer;
 
 // Filter panel
 @property (nonatomic, strong) UIView *panel;
@@ -144,6 +154,11 @@ static UIColor *OCAccent(void) {
     [self observeLife];
     [self requestPermissionsAndStart];
     [_netManager start];
+    [self updateDeviceStatus];
+    __weak typeof(self) wself = self;
+    _deviceStatusTimer = [NSTimer scheduledTimerWithTimeInterval:10.0 repeats:YES block:^(NSTimer *t) {
+        [wself updateDeviceStatus];
+    }];
 }
 
 - (void)dealloc {
@@ -225,7 +240,7 @@ static UIColor *OCAccent(void) {
                                                object:_filterState];
     [[NSNotificationCenter defaultCenter] addObserver:self
                                              selector:@selector(lutsChanged:)
-                                                 name:OCImportedLutsDidChangeNotification
+                                                 name:OCLutsDidChangeNotification
                                                object:nil];
     [[NSNotificationCenter defaultCenter] addObserver:self
                                              selector:@selector(appBackgrounded:)
@@ -242,11 +257,12 @@ static UIColor *OCAccent(void) {
     // produced SpringBoard 0x8badf00d / "Suspending" assertion crashes on iOS 12.
     if (_netManager.streaming) [_netManager stopStreaming];
     [_captureEngine stop];
+    [self undim]; // give the user their backlight back
 }
 
 - (void)appActive:(NSNotification *)n {
     [_captureEngine ensureRunning];
-    _ipLabel.text = [NSString stringWithFormat:@"IP %@", [OCNetManager localIPv4] ?: @"—"];
+    [self updateDeviceStatus];
 }
 
 #pragma mark UI construction
@@ -365,7 +381,147 @@ static UIColor *OCAccent(void) {
     _panelToggleButton = [self makeButton:@"FILTERS  \u25B2" frame:CGRectZero action:@selector(panelToggled:)];
     [self.view addSubview:_panelToggleButton];
 
+    _dimButton = [self makeButton:@"DIM" frame:CGRectZero action:@selector(dimTapped:)];
+    [self.view addSubview:_dimButton];
+
     [self buildFilterPanel];
+    [self buildFocusUI];
+    [self buildDimCover];
+}
+
+#pragma mark Focus / dim
+
+- (void)buildFocusUI {
+    _focusSquare = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 76, 76)];
+    _focusSquare.layer.borderColor = OCAccent().CGColor;
+    _focusSquare.layer.borderWidth = 1.5;
+    _focusSquare.userInteractionEnabled = NO;
+    _focusSquare.alpha = 0.0;
+    _focusLockLabel = [self makeLabel:@"AE/AF LOCK"
+                                 font:[UIFont systemFontOfSize:9 weight:UIFontWeightBold]
+                                color:[UIColor blackColor]];
+    _focusLockLabel.backgroundColor = OCAccent();
+    _focusLockLabel.textAlignment = NSTextAlignmentCenter;
+    _focusLockLabel.frame = CGRectMake(4, -16, 68, 13);
+    [_focusSquare addSubview:_focusLockLabel];
+    // Above the preview, below every control.
+    if (_mtkView) {
+        [self.view insertSubview:_focusSquare aboveSubview:_mtkView];
+    } else {
+        [self.view insertSubview:_focusSquare atIndex:0];
+    }
+
+    // Tap = focus + expose there (keeps tracking); long-press = lock AE/AF;
+    // double-tap = back to continuous auto.
+    UITapGestureRecognizer *dbl = [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(previewDoubleTapped:)];
+    dbl.numberOfTapsRequired = 2;
+    dbl.delegate = self;
+    [self.view addGestureRecognizer:dbl];
+    UITapGestureRecognizer *tap = [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(previewTapped:)];
+    tap.delegate = self;
+    [tap requireGestureRecognizerToFail:dbl];
+    [self.view addGestureRecognizer:tap];
+    UILongPressGestureRecognizer *lp = [[UILongPressGestureRecognizer alloc] initWithTarget:self action:@selector(previewLongPressed:)];
+    lp.minimumPressDuration = 0.6;
+    lp.delegate = self;
+    [self.view addGestureRecognizer:lp];
+}
+
+// Only touches on the bare preview focus; controls and the panel keep theirs.
+- (BOOL)gestureRecognizer:(UIGestureRecognizer *)gr shouldReceiveTouch:(UITouch *)touch {
+    if (!_dimCover.hidden) return NO;
+    return touch.view == self.view || (_mtkView && touch.view == _mtkView);
+}
+
+- (void)previewTapped:(UITapGestureRecognizer *)gr {
+    if (_panelOpen) { // a tap outside the open panel closes it, like a sheet
+        [self panelToggled:_panelToggleButton];
+        return;
+    }
+    [self focusAtViewPoint:[gr locationInView:self.view] lock:NO];
+}
+
+- (void)previewLongPressed:(UILongPressGestureRecognizer *)gr {
+    if (gr.state != UIGestureRecognizerStateBegan) return;
+    [self focusAtViewPoint:[gr locationInView:self.view] lock:YES];
+}
+
+- (void)previewDoubleTapped:(UITapGestureRecognizer *)gr {
+    [_captureEngine resumeContinuousFocus];
+    [self showFocusAtViewPoint:CGPointMake(CGRectGetMidX(self.view.bounds), CGRectGetMidY(self.view.bounds))
+                        locked:NO];
+    _statusLabel.text = @"focus: auto";
+}
+
+- (void)focusAtViewPoint:(CGPoint)pt lock:(BOOL)lock {
+    // The preview layer knows the gravity, orientation and mirroring; it stays
+    // laid out (just hidden) while the filtered MTKView preview is shown.
+    CGPoint poi = [_previewLayer captureDevicePointOfInterestForPoint:pt];
+    [_captureEngine focusAtDevicePoint:poi lock:lock];
+    [self showFocusAtViewPoint:pt locked:lock];
+    if (lock) _statusLabel.text = @"AE/AF locked \u2014 double-tap for auto";
+}
+
+- (void)showFocusAtViewPoint:(CGPoint)pt locked:(BOOL)locked {
+    _focusSquare.center = pt;
+    _focusLockLabel.hidden = !locked;
+    [_focusSquare.layer removeAllAnimations];
+    _focusSquare.transform = CGAffineTransformMakeScale(1.4, 1.4);
+    _focusSquare.alpha = 1.0;
+    [UIView animateWithDuration:0.2 animations:^{
+        self->_focusSquare.transform = CGAffineTransformIdentity;
+    } completion:^(BOOL finished) {
+        if (!finished) return;
+        [UIView animateWithDuration:0.4 delay:(locked ? 2.0 : 0.8) options:0 animations:^{
+            self->_focusSquare.alpha = 0.0;
+        } completion:nil];
+    }];
+}
+
+// Full-screen black cover + minimum backlight: the phone sits on a tripod as a
+// webcam for hours, and the screen is most of the heat and battery drain.
+- (void)buildDimCover {
+    _dimCover = [[UIView alloc] init];
+    _dimCover.backgroundColor = [UIColor blackColor];
+    _dimCover.hidden = YES;
+    _dimLabel = [self makeLabel:@"" font:[UIFont systemFontOfSize:13 weight:UIFontWeightMedium]
+                          color:[UIColor colorWithWhite:1.0 alpha:0.35]];
+    _dimLabel.numberOfLines = 2;
+    _dimLabel.textAlignment = NSTextAlignmentCenter;
+    [_dimCover addSubview:_dimLabel];
+    [_dimCover addGestureRecognizer:[[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(undim)]];
+    [self.view addSubview:_dimCover];
+}
+
+- (void)dimTapped:(UIButton *)sender {
+    if (!_dimCover.hidden) return;
+    _brightnessBeforeDim = [UIScreen mainScreen].brightness;
+    [UIScreen mainScreen].brightness = 0.0;
+    _dimCover.hidden = NO;
+    [self.view bringSubviewToFront:_dimCover];
+    [self updateDeviceStatus];
+}
+
+- (void)undim {
+    if (_dimCover.hidden) return;
+    _dimCover.hidden = YES;
+    [UIScreen mainScreen].brightness = _brightnessBeforeDim;
+}
+
+- (void)updateDeviceStatus {
+    NSDictionary *st = [OCNetManager deviceStatus];
+    double batt = [st[@"batt"] doubleValue];
+    NSString *thermal = st[@"thermal"];
+    NSString *battText = batt < 0 ? @"\u2014" : [NSString stringWithFormat:@"%.0f%%%@", batt * 100.0,
+                                                 [st[@"charging"] boolValue] ? @" \u26A1" : @""];
+    BOOL hot = [thermal isEqualToString:@"serious"] || [thermal isEqualToString:@"critical"];
+    NSString *heat = [thermal isEqualToString:@"nominal"] ? @"" : [@"  \u00B7  " stringByAppendingString:thermal];
+    _ipLabel.text = [NSString stringWithFormat:@"IP %@  \u00B7  %@%@",
+                     [OCNetManager localIPv4] ?: @"\u2014", battText, heat];
+    _ipLabel.textColor = hot ? [UIColor colorWithRed:1.0 green:0.35 blue:0.3 alpha:1.0]
+                             : [UIColor colorWithWhite:1.0 alpha:0.6];
+    _dimLabel.text = [NSString stringWithFormat:@"%@  \u00B7  battery %@%@\ntap to wake",
+                      _netManager.streaming ? @"streaming" : @"not streaming", battText, heat];
 }
 
 #pragma mark Filter panel
@@ -587,10 +743,11 @@ static UIColor *OCAccent(void) {
     _startButton.frame = CGRectMake(12, by, 108, 44);
     _cameraButton.frame = CGRectMake(128, by, 78, 44);
     _torchButton.frame = CGRectMake(214, by, 72, 44);
+    _dimButton.frame = CGRectMake(294, by, 56, 44);
     _abrSwitch.frame = CGRectMake(bw - 66, by + 6, 51, 31);
     UILabel *abrL = (UILabel *)[self.view viewWithTag:771];
     abrL.frame = CGRectMake(bw - 106, by + 12, 36, 16);
-    _bitrateLabel.frame = CGRectMake(296, by + 14, bw - 410, 16);
+    _bitrateLabel.frame = CGRectMake(360, by + 14, MAX(0.0, bw - 474), 16);
 
     _resControl.frame = CGRectMake(12, by + 52, 170, 30);
     _zoomValueLabel.frame = CGRectMake(190, by + 56, 42, 16);
@@ -603,6 +760,9 @@ static UIColor *OCAccent(void) {
     _panel.frame = CGRectMake((bw - pw) / 2.0, by - panelH - 6, pw, panelH);
     _panelScroll.frame = _panel.bounds;
     _panel.hidden = !_panelOpen || panelH < 10;
+
+    _dimCover.frame = b;
+    _dimLabel.frame = CGRectMake(20, b.size.height / 2.0 - 20, b.size.width - 40, 40);
 }
 
 - (UIInterfaceOrientationMask)supportedInterfaceOrientations {
@@ -941,6 +1101,7 @@ didPickDocumentsAtURLs:(NSArray<NSURL *> *)urls {
         _statsLabel.text = @"idle";
         _bitrateLabel.text = @"";
     }
+    [self updateDeviceStatus];
 }
 
 - (void)netManager:(OCNetManager *)manager activeCameraDidChange:(NSString *)cameraId {
@@ -994,6 +1155,19 @@ didPickDocumentsAtURLs:(NSArray<NSURL *> *)urls {
         fps, kbps, encMs, lossPct, nacks, sent];
     _bitrateLabel.text = [NSString stringWithFormat:@"%@%.0f kbps",
                           manager.abrAuto ? @"auto " : @"", kbps];
+}
+
+- (void)netManager:(OCNetManager *)manager didFocusAtStreamPoint:(CGPoint)point
+            locked:(BOOL)locked auto:(BOOL)isAuto {
+    if (isAuto) {
+        _statusLabel.text = @"focus: auto (PC)";
+        return;
+    }
+    // Stream point -> preview point, through the device POI (undo front mirroring).
+    CGPoint poi = point;
+    if ([_captureEngine.activeCameraId isEqualToString:@"front"]) poi.x = 1.0 - poi.x;
+    [self showFocusAtViewPoint:[_previewLayer pointForCaptureDevicePointOfInterest:poi] locked:locked];
+    _statusLabel.text = locked ? @"AE/AF locked by PC" : @"focus set by PC";
 }
 
 - (void)netManager:(OCNetManager *)manager didFailWithMessage:(NSString *)message {

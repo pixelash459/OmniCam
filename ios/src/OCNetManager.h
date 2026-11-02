@@ -8,6 +8,7 @@
 //
 //  Also owns the §6 adaptive bitrate driven by `rr` messages and the 1 Hz `stats`.
 #import <Foundation/Foundation.h>
+#import <CoreGraphics/CoreGraphics.h>
 #import "OCFilterState.h"
 
 NS_ASSUME_NONNULL_BEGIN
@@ -17,7 +18,7 @@ extern const int OCVideoPort;    // 9921
 extern const int OCControlPort;  // 9923
 
 extern NSString * const OCMagicString;       // "OMNICAM1"
-extern NSString * const OCAppVersionString;  // "1.2.2"
+extern NSString * const OCAppVersionString;  // "1.3.0"
 
 @class OCNetManager, OCCaptureEngine, OCEncoder, OCPacker;
 
@@ -34,6 +35,10 @@ extern NSString * const OCAppVersionString;  // "1.2.2"
                                   lossPct:(double)lossPct nacks:(uint32_t)nacks
                                      sent:(uint32_t)sent;
 - (void)netManager:(OCNetManager *)manager didFailWithMessage:(NSString *)message;
+/// PC clicked its preview: point is normalized in the stream frame (top-left
+/// origin). auto = YES means focus went back to continuous (point ignored).
+- (void)netManager:(OCNetManager *)manager didFocusAtStreamPoint:(CGPoint)point
+            locked:(BOOL)locked auto:(BOOL)isAuto;
 @end
 
 @interface OCNetManager : NSObject
@@ -92,6 +97,13 @@ extern NSString * const OCAppVersionString;  // "1.2.2"
 
 /// Sends the current filter state to the PC (called on filter changes).
 - (void)pushFilterState;
+
+/// Sends {"t":"luts","names":[...]} (imported .cube files) to the PC.
+- (void)pushLutList;
+
+/// Battery / thermal snapshot shared by `stats` and the phone HUD:
+/// batt (0..1, -1 unknown), charging (bool), thermal (nominal|fair|serious|critical).
++ (NSDictionary *)deviceStatus;
 
 /// Wi-Fi IPv4 of interface en0/en1 (for the UI), or nil.
 + (nullable NSString *)localIPv4;

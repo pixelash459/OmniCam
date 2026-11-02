@@ -58,6 +58,7 @@ static uint64_t ocNowMs(void) {
 @property (nonatomic, strong, nullable) CIImage *overlayImage;
 @property (nonatomic, copy, nullable) NSString *overlayCacheKey;
 @property (nonatomic, assign) CGFloat overlayCacheWidth;
+@property (nonatomic, assign) BOOL overlayBuildPending; // one main-thread rebuild in flight
 
 // Lazy UTC timecode formatter (HH:mm:ss).
 @property (nonatomic, strong, nullable) NSDateFormatter *tcFormatter;
@@ -542,26 +543,17 @@ static uint64_t ocNowMs(void) {
         img = [self crop:img toRect:wext]; // blur/distortion filters inflate the extent
     }
 
-    // ---- 6. Beauty (YUCIHighPassSkinSmoothing-style, built-in filters only).
+    // ---- 6. Beauty (mid-tone masked blur, built-in filters only).
     if (st.beauty > 0.001) {
         CIImage *orig = img;
-        CIImage *blurred = [self applyFilter:@"CIGaussianBlur" input:orig setup:^(CIFilter *f) {
+        // Low-pass of the frame. Clamp first so the blur does not pull transparent
+        // black in from outside (dark halo at the edges), then crop back.
+        // The old high-pass chain added the blur instead of subtracting it
+        // (orig + blurred − 0.5), which crushed mid-tones and never smoothed.
+        CIImage *blurred = [self applyFilter:@"CIGaussianBlur" input:[orig imageByClampingToExtent] setup:^(CIFilter *f) {
             [f setValue:@8.0 forKey:@"inputRadius"];
         }];
-        // highPass = orig − blurred + 0.5: bias the blur down half-way, then add.
-        CIImage *biased = [self applyFilter:@"CIColorMatrix" input:blurred setup:^(CIFilter *f) {
-            [f setValue:[CIVector vectorWithX:1 Y:0 Z:0 W:0] forKey:@"inputRVector"];
-            [f setValue:[CIVector vectorWithX:0 Y:1 Z:0 W:0] forKey:@"inputGVector"];
-            [f setValue:[CIVector vectorWithX:0 Y:0 Z:1 W:0] forKey:@"inputBVector"];
-            [f setValue:[CIVector vectorWithX:0 Y:0 Z:0 W:1] forKey:@"inputAVector"];
-            [f setValue:[CIVector vectorWithX:-0.5 Y:-0.5 Z:-0.5 W:0] forKey:@"inputBiasVector"];
-        }];
-        CIImage *highPass = [self applyFilter:@"CIAdditionCompositing" input:orig setup:^(CIFilter *f) {
-            [f setValue:biased forKey:kCIInputBackgroundImageKey];
-        }];
-        CIImage *smoothed = [self applyFilter:@"CIHardLightBlendMode" input:orig setup:^(CIFilter *f) {
-            [f setValue:highPass forKey:kCIInputBackgroundImageKey];
-        }];
+        CIImage *smoothed = [self crop:blurred toRect:orig.extent];
         // Restrict smoothing to mid-tones (skin): band = min(lum, 1−lum), boosted.
         CIImage *lum = [self applyFilter:@"CIColorControls" input:orig setup:^(CIFilter *f) {
             [f setValue:@0.0 forKey:@"inputSaturation"];
@@ -625,29 +617,43 @@ static uint64_t ocNowMs(void) {
     return [fmt stringFromDate:[NSDate date]];
 }
 
+// Runs on the render queue, which owns the overlay cache ivars.
 - (nullable CIImage *)overlayImageForState:(OCFilterState *)st width:(CGFloat)width {
+    NSString *text = st.overlayText ?: @"";
     NSString *tc = st.showTimecode ? [self utcTimecode] : nil;
-    NSString *key = [NSString stringWithFormat:@"%@\001%@", st.overlayText ?: @"", tc ?: @""];
+    NSString *key = [NSString stringWithFormat:@"%@\001%@", text, tc ?: @""];
     if (_overlayCacheKey && _overlayImage &&
         [_overlayCacheKey isEqualToString:key] && fabs(_overlayCacheWidth - width) < 1.0) {
         return _overlayImage;
     }
     // UIKit bitmap APIs must run on the main thread (iOS 12 can abort otherwise).
-    if (![NSThread isMainThread]) {
+    // Build there, then hand the result back to this queue: writing the cache
+    // from main raced these reads, and every frame queued another rebuild.
+    if (!_overlayBuildPending) {
+        _overlayBuildPending = YES;
         dispatch_async(dispatch_get_main_queue(), ^{
-            (void)[self overlayImageForState:st width:width];
+            CIImage *built = [self buildOverlayWithText:text timecode:tc width:width];
+            dispatch_async(self->_renderQueue, ^{
+                self->_overlayImage = built;
+                self->_overlayCacheKey = key;
+                self->_overlayCacheWidth = width;
+                self->_overlayBuildPending = NO;
+            });
         });
-        return _overlayImage; // previous cache, or nil for one frame
     }
+    return _overlayImage; // previous cache, or nil for one frame
+}
 
+// Main thread only.
+- (CIImage *)buildOverlayWithText:(NSString *)text timecode:(nullable NSString *)tc width:(CGFloat)width {
     CGFloat scaleF = MAX(0.5, width / 1280.0);
     CGFloat font = MAX(16.0, 30.0 * scaleF);
     CGFloat pad = 10.0 * scaleF;
 
     NSMutableAttributedString *as = [[NSMutableAttributedString alloc] init];
-    if (st.overlayText.length > 0) {
+    if (text.length > 0) {
         [as appendAttributedString:[[NSAttributedString alloc]
-            initWithString:st.overlayText
+            initWithString:text
                 attributes:@{NSFontAttributeName : [UIFont systemFontOfSize:font weight:UIFontWeightSemibold],
                              NSForegroundColorAttributeName : [UIColor whiteColor]}]];
     }
@@ -680,10 +686,7 @@ static uint64_t ocNowMs(void) {
         [as drawInRect:CGRectMake(pad, pad * 0.5, size.width - pad * 2, size.height - pad)];
     }];
 
-    _overlayImage = [CIImage imageWithCGImage:ui.CGImage];
-    _overlayCacheKey = key;
-    _overlayCacheWidth = width;
-    return _overlayImage;
+    return [CIImage imageWithCGImage:ui.CGImage];
 }
 
 #pragma mark One-shot render (WYSIWYG snapshots)
