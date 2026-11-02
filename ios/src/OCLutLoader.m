@@ -83,7 +83,10 @@ static const NSUInteger OCLutMaxSize = 64;
         NSString *line = [rawLine stringByTrimmingCharactersInSet:ws];
         if (line.length == 0 || [line hasPrefix:@"#"]) continue;
 
-        NSArray<NSString *> *tok = [line componentsSeparatedByCharactersInSet:ws];
+        // Drop the empty tokens that runs of spaces/tabs produce: "LUT_3D_SIZE  33"
+        // or "0.1\t0.2\t0.3" padded files otherwise parsed as size 0 / zeros.
+        NSArray<NSString *> *tok = [[line componentsSeparatedByCharactersInSet:ws]
+            filteredArrayUsingPredicate:[NSPredicate predicateWithFormat:@"length > 0"]];
         NSString *kw = tok.firstObject.uppercaseString;
 
         if ([kw isEqualToString:@"TITLE"]) {
@@ -145,9 +148,11 @@ static const NSUInteger OCLutMaxSize = 64;
 }
 
 - (nullable NSData *)cubeDataForLutNamed:(NSString *)name {
+    // The name can come from the PC (filter state); never let it leave Documents.
+    name = name.lastPathComponent;
     if (name.length == 0) return nil;
     NSData *cached = [_cache objectForKey:name];
-    if (cached) return cached;
+    if (cached) return cached.length ? cached : nil; // empty = known-bad file
 
     NSString *path = [[OCLutLoader lutsDirectory] stringByAppendingPathComponent:name];
     NSError *err = nil;
@@ -157,10 +162,10 @@ static const NSUInteger OCLutMaxSize = 64;
                                             encoding:[NSString defaultCStringEncoding]
                                                error:nil];
     }
-    if (!content) return nil;
-
-    NSData *cube = [self cubeDataFromString:content size:NULL];
-    if (cube) [_cache setObject:cube forKey:name];
+    NSData *cube = content ? [self cubeDataFromString:content size:NULL] : nil;
+    // Cache failures too: this runs per frame, and a missing or invalid LUT
+    // was re-read and re-parsed 30 times a second. Import clears the cache.
+    [_cache setObject:(cube ?: [NSData data]) forKey:name];
     return cube;
 }
 

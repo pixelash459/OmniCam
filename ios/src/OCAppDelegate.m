@@ -54,6 +54,7 @@ static void OCRedirectLogToFile(void) {
         NSLog(@"[OmniCam] LUT import failed: %@", err);
         return NO;
     }
+    // importCubeFileAtURL posts OCLutsDidChangeNotification for the UI.
     dispatch_async(dispatch_get_main_queue(), ^{
         [[NSNotificationCenter defaultCenter] postNotificationName:OCImportedLutsDidChangeNotification object:nil];
     });
