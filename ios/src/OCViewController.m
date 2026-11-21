@@ -79,7 +79,11 @@ static UIColor *OCAccent(void) {
 // Top HUD
 @property (nonatomic, strong) UILabel *statsLabel;
 @property (nonatomic, strong) UILabel *statusLabel;
-@property (nonatomic, strong) UILabel *ipLabel;
+@property (nonatomic, strong) UILabel *ipLabel;      // battery / thermal under the IP pill
+@property (nonatomic, strong) UIButton *ipButton;    // "IP 192.168.x.y", tap for the big card
+@property (nonatomic, strong) UIControl *ipCard;     // full-screen cover holding the big IP
+@property (nonatomic, strong) UILabel *ipCardAddress;
+@property (nonatomic, strong) UIView *ipCardPanel;
 
 // Bottom controls
 @property (nonatomic, strong) UIButton *startButton;
@@ -315,8 +319,24 @@ static UIColor *OCAccent(void) {
                           font:[UIFont monospacedDigitSystemFontOfSize:11 weight:UIFontWeightRegular]
                          color:[UIColor colorWithWhite:1.0 alpha:0.6]];
     _ipLabel.textAlignment = NSTextAlignmentRight;
-    _ipLabel.text = [NSString stringWithFormat:@"IP %@", [OCNetManager localIPv4] ?: @"—"];
+    _ipLabel.text = @"";
     [self.view addSubview:_ipLabel];
+
+    // The phone's own address, readable at a glance; tap for a big copyable card.
+    _ipButton = [UIButton buttonWithType:UIButtonTypeSystem];
+    _ipButton.titleLabel.font = [UIFont monospacedDigitSystemFontOfSize:13 weight:UIFontWeightSemibold];
+    _ipButton.titleLabel.adjustsFontSizeToFitWidth = YES;
+    _ipButton.titleLabel.minimumScaleFactor = 0.75;
+    _ipButton.tintColor = [UIColor whiteColor];
+    _ipButton.backgroundColor = [UIColor colorWithWhite:0.0 alpha:0.55];
+    _ipButton.layer.cornerRadius = 13.0;
+    _ipButton.layer.borderWidth = 1.0;
+    _ipButton.layer.borderColor = [UIColor colorWithWhite:1.0 alpha:0.25].CGColor;
+    _ipButton.contentEdgeInsets = UIEdgeInsetsMake(0, 10, 0, 10);
+    [_ipButton addTarget:self action:@selector(ipTapped:) forControlEvents:UIControlEventTouchUpInside];
+    [self.view addSubview:_ipButton];
+    [self buildIpCard];
+    [self refreshIpButton];
 
     // --- WYSIWYG Metal preview (shown instead of the preview layer when filters are active)
     if (_pipeline.metalDevice != nil) {
@@ -517,6 +537,96 @@ static UIColor *OCAccent(void) {
     [UIScreen mainScreen].brightness = _brightnessBeforeDim;
 }
 
+#pragma mark Phone IP
+
+- (void)refreshIpButton {
+    NSString *ip = [OCNetManager localIPv4];
+    [_ipButton setTitle:ip ? [NSString stringWithFormat:@"IP %@", ip] : @"No Wi-Fi"
+               forState:UIControlStateNormal];
+    _ipCardAddress.text = ip ?: @"No Wi-Fi";
+}
+
+- (void)buildIpCard {
+    _ipCard = [[UIControl alloc] init];
+    _ipCard.backgroundColor = [UIColor colorWithWhite:0.0 alpha:0.7];
+    _ipCard.hidden = YES;
+    [_ipCard addTarget:self action:@selector(ipCardDismiss) forControlEvents:UIControlEventTouchUpInside];
+
+    _ipCardPanel = [[UIView alloc] init];
+    _ipCardPanel.backgroundColor = [UIColor colorWithWhite:0.1 alpha:0.96];
+    _ipCardPanel.layer.cornerRadius = 16.0;
+    _ipCardPanel.layer.borderWidth = 1.0;
+    _ipCardPanel.layer.borderColor = [OCAccent() colorWithAlphaComponent:0.6].CGColor;
+    [_ipCard addSubview:_ipCardPanel];
+
+    UILabel *title = [self makeLabel:@"THIS PHONE'S IP"
+                                font:[UIFont systemFontOfSize:12 weight:UIFontWeightSemibold]
+                               color:[UIColor colorWithWhite:1.0 alpha:0.6]];
+    title.textAlignment = NSTextAlignmentCenter;
+    title.tag = 801;
+    [_ipCardPanel addSubview:title];
+
+    _ipCardAddress = [self makeLabel:@""
+                                font:[UIFont monospacedDigitSystemFontOfSize:40 weight:UIFontWeightBold]
+                               color:[UIColor whiteColor]];
+    _ipCardAddress.textAlignment = NSTextAlignmentCenter;
+    _ipCardAddress.adjustsFontSizeToFitWidth = YES;
+    _ipCardAddress.minimumScaleFactor = 0.5;
+    [_ipCardPanel addSubview:_ipCardAddress];
+
+    UILabel *hint = [self makeLabel:@"OmniCam PC finds this phone by itself on the same Wi-Fi. "
+                                     "If it does not, type this IP into Manual IP and press Connect."
+                               font:[UIFont systemFontOfSize:13]
+                              color:[UIColor colorWithWhite:1.0 alpha:0.75]];
+    hint.textAlignment = NSTextAlignmentCenter;
+    hint.numberOfLines = 0;
+    hint.tag = 802;
+    [_ipCardPanel addSubview:hint];
+
+    UIButton *copy = [self makeButton:@"COPY" frame:CGRectZero action:@selector(ipCopyTapped:)];
+    copy.backgroundColor = OCAccent();
+    copy.tag = 803;
+    [_ipCardPanel addSubview:copy];
+    UIButton *close = [self makeButton:@"CLOSE" frame:CGRectZero action:@selector(ipCardDismiss)];
+    close.tag = 804;
+    [_ipCardPanel addSubview:close];
+
+    [self.view addSubview:_ipCard];
+}
+
+- (void)layoutIpCard {
+    CGRect b = self.view.bounds;
+    _ipCard.frame = b;
+    CGFloat pw = MIN(380.0, b.size.width - 32.0);
+    CGFloat ph = 236.0;
+    _ipCardPanel.frame = CGRectMake((b.size.width - pw) / 2.0, (b.size.height - ph) / 2.0, pw, ph);
+    CGFloat inner = pw - 32.0;
+    [_ipCardPanel viewWithTag:801].frame = CGRectMake(16, 18, inner, 16);
+    _ipCardAddress.frame = CGRectMake(16, 40, inner, 52);
+    [_ipCardPanel viewWithTag:802].frame = CGRectMake(16, 98, inner, 64);
+    CGFloat bw2 = (inner - 12.0) / 2.0;
+    [_ipCardPanel viewWithTag:803].frame = CGRectMake(16, ph - 60, bw2, 44);
+    [_ipCardPanel viewWithTag:804].frame = CGRectMake(16 + bw2 + 12, ph - 60, bw2, 44);
+}
+
+- (void)ipTapped:(UIButton *)sender {
+    [self refreshIpButton];
+    [(UIButton *)[_ipCardPanel viewWithTag:803] setTitle:@"COPY" forState:UIControlStateNormal];
+    _ipCard.hidden = NO;
+    [self.view bringSubviewToFront:_ipCard];
+}
+
+- (void)ipCopyTapped:(UIButton *)sender {
+    NSString *ip = [OCNetManager localIPv4];
+    if (!ip) return;
+    [UIPasteboard generalPasteboard].string = ip;
+    [sender setTitle:@"COPIED" forState:UIControlStateNormal];
+}
+
+- (void)ipCardDismiss {
+    _ipCard.hidden = YES;
+}
+
 - (void)updateDeviceStatus {
     NSDictionary *st = [OCNetManager deviceStatus];
     double batt = [st[@"batt"] doubleValue];
@@ -525,8 +635,8 @@ static UIColor *OCAccent(void) {
                                                  [st[@"charging"] boolValue] ? @" \u26A1" : @""];
     BOOL hot = [thermal isEqualToString:@"serious"] || [thermal isEqualToString:@"critical"];
     NSString *heat = [thermal isEqualToString:@"nominal"] ? @"" : [@"  \u00B7  " stringByAppendingString:thermal];
-    _ipLabel.text = [NSString stringWithFormat:@"IP %@  \u00B7  %@%@",
-                     [OCNetManager localIPv4] ?: @"\u2014", battText, heat];
+    _ipLabel.text = [NSString stringWithFormat:@"%@%@", battText, heat];
+    [self refreshIpButton];
     _ipLabel.textColor = hot ? [UIColor colorWithRed:1.0 green:0.35 blue:0.3 alpha:1.0]
                              : [UIColor colorWithWhite:1.0 alpha:0.6];
     _dimLabel.text = [NSString stringWithFormat:@"%@  \u00B7  battery %@%@\ntap to wake",
@@ -746,8 +856,10 @@ static UIColor *OCAccent(void) {
     BOOL wide = b.size.width >= 600.0;
     CGFloat barH = wide ? 162.0 : 176.0;
 
-    _statsLabel.frame = CGRectMake(10, safeTop, b.size.width * 0.62, 64);
-    _ipLabel.frame = CGRectMake(b.size.width * 0.66, safeTop, b.size.width * 0.34 - 10, 16);
+    CGFloat ipW = MIN(190.0, MAX(150.0, b.size.width * 0.34));
+    _statsLabel.frame = CGRectMake(10, safeTop, MIN(b.size.width * 0.62, b.size.width - ipW - 28), 64);
+    _ipButton.frame = CGRectMake(b.size.width - ipW - 10, safeTop - 4, ipW, 26);
+    _ipLabel.frame = CGRectMake(b.size.width - ipW - 10, safeTop + 26, ipW - 4, 14);
     _statusLabel.frame = CGRectMake(b.size.width * 0.2, safeTop + 66, b.size.width * 0.6, 16);
 
     CGFloat by = b.size.height - barH - 8;
@@ -797,6 +909,7 @@ static UIColor *OCAccent(void) {
     _panel.hidden = !_panelOpen || panelH < 10;
 
     _dimCover.frame = b;
+    [self layoutIpCard];
     _dimLabel.frame = CGRectMake(20, b.size.height / 2.0 - 20, b.size.width - 40, 40);
 }
 

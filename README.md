@@ -25,7 +25,7 @@ No Apple developer account. The `.ipa` is `ldid` fake-signed for AppSync.
 ## End-user install (Releases)
 
 Binaries for each version live on the [Releases](https://github.com/pixelash459/OmniCam/releases) page:
-`OmniCam.ipa` and `OmniCam-PC-<ver>-Setup.exe` (current: **1.4.0**).
+`OmniCam.ipa` and `OmniCam-PC-<ver>-Setup.exe` (current: phone **1.4.1**, PC **1.4.0**).
 
 1. **Phone** — open Filza’s web server (port 2222), upload the IPA from
    `http://<phone-ip>:2222`, tap **Install**. Or copy via 3uTools / iMazing.
@@ -72,7 +72,8 @@ A copy of the IPA also sits in `dist/OmniCam.ipa` in this repo.
   Tips: put a lamp on the hands (the smaller the gap between screen and hands, the
   better both look), keep the player's screen brightness around 50–70 %, and avoid
   auto-brightness on the player's phone.
-- The phone's bottom bar now also lays out properly in portrait.
+- The phone's bottom bar now also lays out properly in portrait, and its IP sits in a
+  pill at the top right; tap it for a large IP card with Copy (1.4.1).
 - Video only — use a separate mic in the meeting app.
 
 ## Troubleshooting
@@ -118,6 +119,7 @@ artifact. CI does not overwrite Releases.
 
 ## Changelog (high level)
 
+- **1.4.1** — Phone shows its IP as a pill; tap it for a large, copyable IP card.
 - **1.4.0** — Handcam screen mode (screen-priority exposure, video HDR, shadow lift), portrait layout fix.
 - **1.3.0** — Remote focus, full PC filter control, paced + delay-aware streaming, new icon.
 - **1.2.2** — Close-to-tray, tray menu, new app icon.
