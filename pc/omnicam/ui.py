@@ -91,7 +91,7 @@ THERMAL_LABELS = {"nominal": "cool", "fair": "warm", "serious": "hot", "critical
 
 RESOLUTIONS: List[Tuple[int, int]] = [(1280, 720), (1920, 1080)]
 FPSES = [30, 24, 15]
-BITRATES_KBPS = [500, 1000, 2000, 3000, 6000]
+BITRATES_KBPS = [500, 1000, 2000, 3000, 6000, 8000, 12000]
 
 SIDEBAR_WIDTH = 312
 
@@ -414,6 +414,10 @@ class MainWindow(QMainWindow):
         grid.add_row("Resolution", self._res_combo)
         grid.add_row("Frame rate", self._fps_combo)
         grid.add_row("Bitrate", self._kbps_combo)
+        self._kbps_combo.setToolTip(
+            "With auto bitrate on this is the ceiling. For recording (handcam, "
+            "tournaments) use 1920 x 1080 with 8000-12000 kbps; below ~2000 kbps "
+            "fine detail like a game screen turns to blocks.")
         self._res_combo.currentIndexChanged.connect(self._on_session_controls_changed)
         self._fps_combo.currentIndexChanged.connect(self._on_session_controls_changed)
         self._kbps_combo.currentIndexChanged.connect(self._on_session_controls_changed)

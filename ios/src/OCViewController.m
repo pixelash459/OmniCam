@@ -353,7 +353,9 @@ static UIColor *OCAccent(void) {
         _mtkView.delegate = self;
         _mtkView.hidden = YES;
         _mtkView.backgroundColor = [UIColor blackColor];
-        [self.view addSubview:_mtkView];
+        // Under the HUD: it is added after the top labels and would hide them
+        // whenever a filter (e.g. screen mode's shadow lift) switches previews.
+        [self.view insertSubview:_mtkView belowSubview:_statsLabel];
     }
 
     // --- Bottom control stack (frames set in viewDidLayoutSubviews)
