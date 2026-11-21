@@ -449,6 +449,20 @@ static uint64_t ocNowMs(void) {
             [f setValue:@(st.sharpness * 2.0) forKey:@"inputIntensity"];
         }];
     }
+    if (st.shadows > 0.001) {
+        // Shadow lift for a handcam: exposure is set by the bright screen, which
+        // leaves the hands around it dark. A global curve that raises the lower
+        // tones but pins white keeps the screen unclipped (cheap on the A8,
+        // unlike a blur-based local tone map).
+        CGFloat a = st.shadows;
+        img = [self applyFilter:@"CIToneCurve" input:img setup:^(CIFilter *f) {
+            [f setValue:[CIVector vectorWithX:0.0 Y:0.0] forKey:@"inputPoint0"];
+            [f setValue:[CIVector vectorWithX:0.10 Y:0.10 + 0.13 * a] forKey:@"inputPoint1"];
+            [f setValue:[CIVector vectorWithX:0.30 Y:0.30 + 0.18 * a] forKey:@"inputPoint2"];
+            [f setValue:[CIVector vectorWithX:0.60 Y:0.60 + 0.10 * a] forKey:@"inputPoint3"];
+            [f setValue:[CIVector vectorWithX:1.0 Y:1.0] forKey:@"inputPoint4"];
+        }];
+    }
     if (st.vignette != 0.0) {
         img = [self applyFilter:@"CIVignette" input:img setup:^(CIFilter *f) {
             [f setValue:@(st.vignette * 2.0) forKey:@"inputIntensity"];

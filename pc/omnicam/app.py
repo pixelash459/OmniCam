@@ -443,6 +443,18 @@ class OmniCamApp:
         self.control.send_torch(on)
         self.push_session({"torch": bool(on)})
 
+    def set_screen_mode(self, on: bool, ev: Optional[float] = None) -> bool:
+        """Handcam screen-mode exposure on the phone (1.4.0+): expose for a
+        bright screen in shot instead of the scene average. Returns False
+        (nothing sent) when the phone does not support it."""
+        if not self.phone_supports("screen_mode"):
+            return False
+        updates: Dict[str, Any] = {"screen": bool(on)}
+        if ev is not None:
+            updates["screen_ev"] = float(ev)
+        self.push_session(updates)
+        return True
+
     def set_zoom(self, x: float) -> None:
         """Capture digital zoom (1.0..8.0, clamped by the phone)."""
         self.control.send_zoom(float(x))

@@ -75,6 +75,7 @@ static NSString *ocOneOf(NSDictionary *d, NSString *key, NSString *def, NSArray<
     _gamma = 1.0;
     _sharpness = 0.0;
     _vignette = 0.0;
+    _shadows = 0.0;
     _beauty = 0.0;
     _stylize = @"none";
     _stylizeAmount = 0.5;
@@ -127,6 +128,7 @@ static NSString *ocOneOf(NSDictionary *d, NSString *key, NSString *def, NSArray<
             @"gamma": @(_gamma),
             @"sharpness": @(_sharpness),
             @"vignette": @(_vignette),
+            @"shadows": @(_shadows),
         },
         @"beauty": @(_beauty),
         @"stylize": _stylize ?: @"none",
@@ -164,6 +166,7 @@ static NSString *ocOneOf(NSDictionary *d, NSString *key, NSString *def, NSArray<
     _gamma         = ocClamp(ocNum(adj, @"gamma", 1.0), 0.2, 3.0);
     _sharpness     = ocClamp(ocNum(adj, @"sharpness", 0.0), 0.0, 1.0);
     _vignette      = ocClamp(ocNum(adj, @"vignette", 0.0), 0.0, 1.0);
+    _shadows       = ocClamp(ocNum(adj, @"shadows", 0.0), 0.0, 1.0);
     _beauty        = ocClamp(ocNum(dict, @"beauty", 0.0), 0.0, 1.0);
     _stylize       = ocOneOf(dict, @"stylize", @"none", [OCFilterState validStylizes]);
     _stylizeAmount = ocClamp(ocNum(dict, @"stylize_amount", 0.5), 0.0, 1.0);
@@ -248,6 +251,7 @@ static id ocPlistSafe(id obj) {
     _gamma      = ocClamp(_gamma, 0.2, 3.0);
     _sharpness  = ocClamp(_sharpness, 0.0, 1.0);
     _vignette   = ocClamp(_vignette, 0.0, 1.0);
+    _shadows    = ocClamp(_shadows, 0.0, 1.0);
     _beauty     = ocClamp(_beauty, 0.0, 1.0);
     _stylizeAmount = ocClamp(_stylizeAmount, 0.0, 1.0);
     _zoom       = ocClamp(_zoom, 0.5, 8.0);
@@ -271,7 +275,7 @@ static id ocPlistSafe(id obj) {
     if (![_look isEqualToString:@"none"]) return NO;
     if (self.brightness != 0.0 || self.contrast != 0.0 || self.saturation != 1.0 ||
         self.temperature != 0.0 || self.vibrance != 0.0 || self.gamma != 1.0 ||
-        self.sharpness != 0.0 || self.vignette != 0.0) return NO;
+        self.sharpness != 0.0 || self.vignette != 0.0 || self.shadows != 0.0) return NO;
     if (self.beauty != 0.0) return NO;
     if (![_stylize isEqualToString:@"none"]) return NO;
     if (self.mirror || self.flipV || self.rotate != 0) return NO;

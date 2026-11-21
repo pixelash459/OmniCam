@@ -10,7 +10,7 @@
 
 from __future__ import annotations
 
-from typing import Dict, Iterable, Optional, Tuple
+from typing import Callable, Dict, Iterable, Optional, Tuple
 
 from PySide6.QtCore import QPointF, QRect, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QFont, QPainter, QPen, QPixmap
@@ -134,8 +134,10 @@ class SliderRow(QWidget):
     """``Title  [=====o====]  42`` -- exposes the inner :class:`QSlider`."""
 
     def __init__(self, title: str, lo: int, hi: int, default: int,
-                 parent: Optional[QWidget] = None) -> None:
+                 parent: Optional[QWidget] = None,
+                 fmt: Optional[Callable[[int], str]] = None) -> None:
         super().__init__(parent)
+        fmt = fmt or str
         row = QHBoxLayout(self)
         row.setContentsMargins(0, 0, 0, 0)
         row.setSpacing(T.SPACE + 4)
@@ -146,14 +148,14 @@ class SliderRow(QWidget):
         self.slider = QSlider(Qt.Orientation.Horizontal)
         self.slider.setRange(lo, hi)
         self.slider.setValue(default)
-        self.value = QLabel(str(default))
+        self.value = QLabel(fmt(default))
         self.value.setObjectName("value")
         self.value.setMinimumWidth(30)
         self.value.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         row.addWidget(self.label)
         row.addWidget(self.slider, 1)
         row.addWidget(self.value)
-        self.slider.valueChanged.connect(lambda v: self.value.setText(str(v)))
+        self.slider.valueChanged.connect(lambda v: self.value.setText(fmt(v)))
 
 
 class PreviewWidget(QWidget):

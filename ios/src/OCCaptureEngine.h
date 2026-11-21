@@ -77,6 +77,19 @@ NS_ASSUME_NONNULL_BEGIN
 /// Back to continuous auto focus / exposure (centre-weighted).
 - (void)resumeContinuousFocus;
 
+/// Handcam "screen mode": instead of averaging the scene (which blows a lit
+/// phone screen out to white), exposure follows the brightest part of the
+/// frame and keeps it just below clipping. Runs its own ISO/shutter loop in
+/// custom exposure mode, preferring a 1/60 s shutter (no refresh banding) and
+/// low ISO. `ev` shifts the screen target (-2..+2 stops). Persisted.
+@property (nonatomic, readonly, getter=isScreenMode) BOOL screenMode;
+@property (nonatomic, readonly) double screenEV;
+- (void)setScreenMode:(BOOL)on ev:(double)ev;
+
+/// Latest exposure readout: "exp_ms", "iso", "hi" (screen level 0..1).
+/// Empty when screen mode is off.
+- (NSDictionary *)exposureInfo;
+
 @end
 
 NS_ASSUME_NONNULL_END

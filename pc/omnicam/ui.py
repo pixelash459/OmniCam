@@ -81,7 +81,11 @@ ADJUST_SLIDERS: List[Tuple[str, str, int, int, int]] = [
     ("gamma", "Gamma", 20, 300, 100),
     ("sharpness", "Sharpness", 0, 100, 0),
     ("vignette", "Vignette", 0, 100, 0),
+    ("shadows", "Shadow lift", 0, 100, 0),
 ]
+
+#: Shadow lift applied when screen mode is switched on with none set.
+SCREEN_MODE_SHADOWS = 50
 
 THERMAL_LABELS = {"nominal": "cool", "fair": "warm", "serious": "hot", "critical": "very hot"}
 
@@ -442,6 +446,23 @@ class MainWindow(QMainWindow):
         self._torch_check.setEnabled(False)
         self._torch_check.toggled.connect(self._on_torch)
         grid.add_span(self._torch_check)
+        self._screen_check = QCheckBox("Screen mode (handcam)")
+        self._screen_check.setEnabled(False)
+        self._screen_check.setToolTip(
+            "Expose for a phone screen in shot so it is not blown out to white, "
+            "then lift the hands around it (Phone Filters > Shadow lift).")
+        self._screen_check.toggled.connect(self._on_screen_mode)
+        grid.add_span(self._screen_check)
+        ev_row = SliderRow("Screen level", -20, 20, 0, fmt=lambda v: f"{v / 10:+.1f} EV")
+        ev_row.slider.setToolTip("Brighter or darker screen target, in stops")
+        ev_row.slider.setEnabled(False)
+        ev_row.slider.valueChanged.connect(self._on_screen_ev)
+        grid.add_span(ev_row)
+        self._screen_ev = ev_row.slider
+        self._screen_info = QLabel("")
+        self._screen_info.setObjectName("muted")
+        self._screen_info.setVisible(False)
+        grid.add_span(self._screen_info)
         self._zoom_spin = QDoubleSpinBox()
         self._zoom_spin.setRange(1.0, 8.0)
         self._zoom_spin.setSingleStep(0.1)
@@ -1153,6 +1174,42 @@ class MainWindow(QMainWindow):
             return
         self._app.set_torch(on)
 
+    def _on_screen_mode(self, on: bool) -> None:
+        if self._syncing_session:
+            return
+        if not self._app.set_screen_mode(on, self._screen_ev.value() / 10.0):
+            self._set_status("this phone build has no screen mode (update OmniCam on the phone)")
+            return
+        if on and self._pf_adjust["shadows"].value() == 0:
+            self._pf_adjust["shadows"].setValue(SCREEN_MODE_SHADOWS)  # pushes the filter
+        self._screen_info.setVisible(on)
+        self._set_status("screen mode on: exposing for the screen" if on else "screen mode off")
+
+    def _on_screen_ev(self, value: int) -> None:
+        if self._syncing_session:
+            return
+        self._app.set_screen_mode(self._screen_check.isChecked(), value / 10.0)
+
+    def _set_screen_controls_enabled(self, enabled: bool) -> None:
+        ok = enabled and self._app.phone_supports("screen_mode")
+        self._screen_check.setEnabled(ok)
+        self._screen_ev.setEnabled(ok)
+
+    @staticmethod
+    def screen_exposure_text(phone: Dict[str, Any]) -> str:
+        """``1/250 s, ISO 29, screen 82%`` from the phone ``stats`` fields."""
+        exp_ms = phone.get("exp_ms")
+        iso = phone.get("iso")
+        hi = phone.get("hi")
+        if not isinstance(exp_ms, (int, float)) or exp_ms <= 0:
+            return ""
+        parts = [f"1/{1000.0 / exp_ms:.0f} s"]
+        if isinstance(iso, (int, float)):
+            parts.append(f"ISO {iso:.0f}")
+        if isinstance(hi, (int, float)):
+            parts.append(f"screen {hi * 100:.0f}%")
+        return ", ".join(parts)
+
     def _on_zoom(self, value: float) -> None:
         if self._syncing_session:
             return
@@ -1361,6 +1418,7 @@ class MainWindow(QMainWindow):
                 self._btn_back.setEnabled(connected)
                 if not connected:
                     self._btn_focus_auto.setEnabled(False)
+                self._set_screen_controls_enabled(connected)
                 self._torch_check.setEnabled(connected and self._app.get_camera() == "back")
                 if not connected:
                     self._video_label.set_placeholder("No stream",
@@ -1378,6 +1436,7 @@ class MainWindow(QMainWindow):
                     self._cam_label.setText(f"camera: {camera}")
                     self._torch_check.setEnabled(camera == "back")
                     self._apply_camera_caps()
+                self._set_screen_controls_enabled(True)
                 self._set_status(f"welcome from {dev} (iOS {ios})")
                 state = self._app.get_filter_state()
                 self._sync_phone_filters(state)
@@ -1476,7 +1535,8 @@ class MainWindow(QMainWindow):
         """Apply a phone session to combos/checkboxes without echoing push_session."""
         self._syncing_session = True
         widgets = (self._res_combo, self._fps_combo, self._kbps_combo,
-                   self._abr_check, self._torch_check, self._zoom_spin)
+                   self._abr_check, self._torch_check, self._zoom_spin,
+                   self._screen_check, self._screen_ev)
         for w in widgets:
             w.blockSignals(True)
         try:
@@ -1502,6 +1562,11 @@ class MainWindow(QMainWindow):
                 self._torch_check.setChecked(bool(state["torch"]))
             if "zoom" in state:
                 self._zoom_spin.setValue(float(state["zoom"]))
+            if "screen" in state:
+                self._screen_check.setChecked(bool(state["screen"]))
+                self._screen_info.setVisible(bool(state["screen"]))
+            if "screen_ev" in state:
+                self._screen_ev.setValue(int(round(float(state["screen_ev"]) * 10)))
             if "camera" in state:
                 cam = str(state["camera"])
                 self._cam_label.setText(f"camera: {cam}")
@@ -1617,6 +1682,9 @@ class MainWindow(QMainWindow):
         for key in ("fps", "kbps", "enc_ms", "loss_pct", "nacks", "sent"):
             val = phone.get(key)
             self._stat_labels[f"phone_{key}"].setText("-" if val is None else str(val))
+        exposure = self.screen_exposure_text(phone)
+        if exposure or not self._screen_check.isChecked():
+            self._screen_info.setText(exposure)
         batt_text, power_text, hot = self.phone_power_text(phone)
         self._stat_labels["phone_batt"].setText(batt_text)
         thermal = str(phone.get("thermal") or "")

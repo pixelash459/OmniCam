@@ -82,6 +82,7 @@ def default_filter_state() -> Dict[str, Any]:
             "gamma": 1.0,        # 0.2..3
             "sharpness": 0.0,    # 0..1
             "vignette": 0.0,     # 0..1
+            "shadows": 0.0,      # 0..1 shadow lift (phone 1.4.0+)
         },
         "beauty": 0.0,           # 0..1
         "stylize": "none",
@@ -100,7 +101,7 @@ def default_filter_state() -> Dict[str, Any]:
     }
 
 
-SESSION_KEYS = ("camera", "w", "h", "fps", "kbps", "abr", "torch", "zoom")
+SESSION_KEYS = ("camera", "w", "h", "fps", "kbps", "abr", "torch", "zoom", "screen", "screen_ev")
 
 
 def default_session_state() -> Dict[str, Any]:
@@ -114,6 +115,8 @@ def default_session_state() -> Dict[str, Any]:
         "abr": True,
         "torch": False,
         "zoom": 1.0,
+        "screen": False,     # handcam screen-mode exposure (phone 1.4.0+)
+        "screen_ev": 0.0,    # -2..2 stops on the screen target
     }
 
 
@@ -135,8 +138,10 @@ def merge_session_state(base: Optional[Dict[str, Any]], updates: Dict[str, Any])
                     state[key] = cam
             elif key in ("w", "h", "fps", "kbps"):
                 state[key] = int(val)
-            elif key in ("abr", "torch"):
+            elif key in ("abr", "torch", "screen"):
                 state[key] = bool(val)
+            elif key == "screen_ev":
+                state[key] = round(max(-2.0, min(2.0, float(val))), 1)
             elif key == "zoom":
                 state[key] = max(1.0, min(8.0, float(val)))
         except (TypeError, ValueError):

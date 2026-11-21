@@ -19,6 +19,7 @@ typedef NS_ENUM(NSInteger, OCSliderTag) {
     OCSliderBrightness = 200, OCSliderContrast, OCSliderSaturation, OCSliderTemperature,
     OCSliderVibrance, OCSliderGamma, OCSliderSharpness, OCSliderVignette,
     OCSliderBeauty, OCSliderStylizeAmount, OCSliderGeoZoom, OCSliderPanX, OCSliderPanY,
+    OCSliderShadows,
     OCSliderCameraZoom = 299,
 };
 
@@ -91,6 +92,7 @@ static UIColor *OCAccent(void) {
 @property (nonatomic, strong) UISlider *cameraZoomSlider;
 @property (nonatomic, strong) UIButton *panelToggleButton;
 @property (nonatomic, strong) UIButton *dimButton;
+@property (nonatomic, strong) UIButton *screenButton;
 
 // Tap-to-focus indicator and the battery-saving dim cover.
 @property (nonatomic, strong) UIView *focusSquare;
@@ -274,6 +276,9 @@ static UIColor *OCAccent(void) {
     b.frame = frame;
     [b setTitle:title forState:UIControlStateNormal];
     b.titleLabel.font = [UIFont systemFontOfSize:14 weight:UIFontWeightSemibold];
+    b.titleLabel.adjustsFontSizeToFitWidth = YES; // narrow portrait bar
+    b.titleLabel.minimumScaleFactor = 0.7;
+    b.titleLabel.lineBreakMode = NSLineBreakByClipping;
     b.tintColor = [UIColor whiteColor];
     b.backgroundColor = [UIColor colorWithWhite:0.18 alpha:1.0];
     b.layer.cornerRadius = 8.0;
@@ -344,6 +349,10 @@ static UIColor *OCAccent(void) {
 
     _torchButton = [self makeButton:@"TORCH" frame:CGRectZero action:@selector(torchTapped:)];
     [self.view addSubview:_torchButton];
+
+    // Handcam: expose for a phone screen in shot, lift the hands around it.
+    _screenButton = [self makeButton:@"SCREEN" frame:CGRectZero action:@selector(screenTapped:)];
+    [self.view addSubview:_screenButton];
 
     _resControl = [[UISegmentedControl alloc] initWithItems:@[@"720p", @"1080p"]];
     _resControl.selectedSegmentIndex = 0;
@@ -606,6 +615,7 @@ static UIColor *OCAccent(void) {
     y = [self addSliderRow:@"Gamma" tag:OCSliderGamma min:0.2 max:3 y:y];
     y = [self addSliderRow:@"Sharpness" tag:OCSliderSharpness min:0 max:1 y:y];
     y = [self addSliderRow:@"Vignette" tag:OCSliderVignette min:0 max:1 y:y];
+    y = [self addSliderRow:@"Shadow lift" tag:OCSliderShadows min:0 max:1 y:y];
 
     y = [self addSectionHeader:@"Beauty" y:y];
     y = [self addSliderRow:@"Skin smooth" tag:OCSliderBeauty min:0 max:1 y:y];
@@ -731,7 +741,10 @@ static UIColor *OCAccent(void) {
     _mtkView.frame = b;
 
     CGFloat safeTop = 24.0;
-    CGFloat barH = 162.0;
+    // Landscape has room for the ABR block beside the buttons; portrait (and
+    // anything narrow) moves it down next to the resolution switch.
+    BOOL wide = b.size.width >= 600.0;
+    CGFloat barH = wide ? 162.0 : 176.0;
 
     _statsLabel.frame = CGRectMake(10, safeTop, b.size.width * 0.62, 64);
     _ipLabel.frame = CGRectMake(b.size.width * 0.66, safeTop, b.size.width * 0.34 - 10, 16);
@@ -740,20 +753,42 @@ static UIColor *OCAccent(void) {
     CGFloat by = b.size.height - barH - 8;
     CGFloat bw = b.size.width;
 
-    _startButton.frame = CGRectMake(12, by, 108, 44);
-    _cameraButton.frame = CGRectMake(128, by, 78, 44);
-    _torchButton.frame = CGRectMake(214, by, 72, 44);
-    _dimButton.frame = CGRectMake(294, by, 56, 44);
-    _abrSwitch.frame = CGRectMake(bw - 66, by + 6, 51, 31);
+    // Row 1: the action buttons share the width by weight.
+    NSArray<UIButton *> *row = @[_startButton, _cameraButton, _torchButton, _dimButton, _screenButton];
+    const CGFloat weights[] = {1.4, 1.0, 1.0, 0.8, 1.1};
+    CGFloat gap = 8.0, weightSum = 0.0;
+    for (NSUInteger i = 0; i < row.count; i++) weightSum += weights[i];
+    CGFloat rightBlock = wide ? 240.0 : 0.0; // bitrate label + ABR switch
+    CGFloat avail = bw - 24.0 - rightBlock - gap * (row.count - 1);
+    CGFloat x = 12.0;
+    for (NSUInteger i = 0; i < row.count; i++) {
+        CGFloat w = floor(avail * weights[i] / weightSum);
+        row[i].frame = CGRectMake(x, by, w, 44);
+        x += w + gap;
+    }
+
     UILabel *abrL = (UILabel *)[self.view viewWithTag:771];
-    abrL.frame = CGRectMake(bw - 106, by + 12, 36, 16);
-    _bitrateLabel.frame = CGRectMake(360, by + 14, MAX(0.0, bw - 474), 16);
+    if (wide) {
+        _abrSwitch.frame = CGRectMake(bw - 66, by + 6, 51, 31);
+        abrL.frame = CGRectMake(bw - 106, by + 12, 36, 16);
+        _bitrateLabel.frame = CGRectMake(x, by + 14, MAX(0.0, bw - 112 - x), 16);
 
-    _resControl.frame = CGRectMake(12, by + 52, 170, 30);
-    _zoomValueLabel.frame = CGRectMake(190, by + 56, 42, 16);
-    _cameraZoomSlider.frame = CGRectMake(236, by + 52, bw - 248, 30);
+        _resControl.frame = CGRectMake(12, by + 52, 170, 30);
+        _zoomValueLabel.frame = CGRectMake(190, by + 56, 42, 16);
+        _cameraZoomSlider.frame = CGRectMake(236, by + 52, bw - 248, 30);
+        _panelToggleButton.frame = CGRectMake(12, by + 90, bw - 24, 40);
+    } else {
+        CGFloat r2 = by + 52;
+        _resControl.frame = CGRectMake(12, r2, 150, 30);
+        _abrSwitch.frame = CGRectMake(bw - 63, r2, 51, 31);
+        abrL.frame = CGRectMake(bw - 101, r2 + 7, 36, 16);
+        _bitrateLabel.frame = CGRectMake(170, r2 + 7, MAX(0.0, bw - 101 - 170 - 4), 16);
 
-    _panelToggleButton.frame = CGRectMake(12, by + 90, bw - 24, 40);
+        CGFloat r3 = by + 92;
+        _zoomValueLabel.frame = CGRectMake(12, r3 + 7, 42, 16);
+        _cameraZoomSlider.frame = CGRectMake(58, r3, bw - 70, 30);
+        _panelToggleButton.frame = CGRectMake(12, by + 132, bw - 24, 40);
+    }
 
     CGFloat panelH = _panelOpen ? MIN(b.size.height - safeTop - barH - 30, 430) : 0;
     CGFloat pw = MIN(450.0, bw - 16);
@@ -825,6 +860,7 @@ static UIColor *OCAccent(void) {
         @(OCSliderGamma) : @(s.gamma),
         @(OCSliderSharpness) : @(s.sharpness),
         @(OCSliderVignette) : @(s.vignette),
+        @(OCSliderShadows) : @(s.shadows),
         @(OCSliderBeauty) : @(s.beauty),
         @(OCSliderStylizeAmount) : @(s.stylizeAmount),
         @(OCSliderGeoZoom) : @(s.zoom),
@@ -925,6 +961,25 @@ static UIColor *OCAccent(void) {
     [_netManager pushSessionState];
 }
 
+- (void)screenTapped:(UIButton *)sender {
+    BOOL on = !_captureEngine.screenMode;
+    [_captureEngine setScreenMode:on ev:_captureEngine.screenEV];
+    // Exposing for the screen leaves the hands dark; start with a moderate
+    // lift unless the user already set one.
+    if (on && _filterState.shadows < 0.001) {
+        [self updateFilterState:^(OCFilterState *s) { s.shadows = 0.5; }];
+        [self applyStateToUI];
+    }
+    [self refreshScreenButton];
+    [_netManager pushSessionState];
+}
+
+- (void)refreshScreenButton {
+    BOOL on = _captureEngine.screenMode;
+    [_screenButton setTitle:on ? @"SCREEN\u2713" : @"SCREEN" forState:UIControlStateNormal];
+    _screenButton.backgroundColor = on ? OCAccent() : [UIColor colorWithWhite:0.18 alpha:1.0];
+}
+
 - (void)resChanged:(UISegmentedControl *)seg {
     BOOL hd = (seg.selectedSegmentIndex == 1);
     [_netManager notifyLocalResolutionHD:hd];
@@ -955,6 +1010,7 @@ static UIColor *OCAccent(void) {
     [_cameraButton setTitle:front ? @"FRONT" : @"BACK" forState:UIControlStateNormal];
     _torchButton.enabled = _captureEngine.torchSupported;
     [_torchButton setTitle:_captureEngine.torchOn ? @"TORCH\u2713" : @"TORCH" forState:UIControlStateNormal];
+    [self refreshScreenButton];
     [_resControl setEnabled:!front forSegmentAtIndex:1];
     if (front && _resControl.selectedSegmentIndex == 1) {
         _resControl.selectedSegmentIndex = 0;
@@ -1014,6 +1070,7 @@ static UIColor *OCAccent(void) {
         case OCSliderGamma:        [self updateFilterState:^(OCFilterState *s) { s.gamma = v; }]; break;
         case OCSliderSharpness:    [self updateFilterState:^(OCFilterState *s) { s.sharpness = v; }]; break;
         case OCSliderVignette:     [self updateFilterState:^(OCFilterState *s) { s.vignette = v; }]; break;
+        case OCSliderShadows:      [self updateFilterState:^(OCFilterState *s) { s.shadows = v; }]; break;
         case OCSliderBeauty:       [self updateFilterState:^(OCFilterState *s) { s.beauty = v; }]; break;
         case OCSliderStylizeAmount:[self updateFilterState:^(OCFilterState *s) { s.stylizeAmount = v; }]; break;
         case OCSliderGeoZoom:      [self updateFilterState:^(OCFilterState *s) { s.zoom = v; }]; break;

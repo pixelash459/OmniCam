@@ -5,7 +5,7 @@
 //  {
 //    "look": "none"*|mono|noir|chrome|fade|instant|process|transfer|sepia|invert|false_color,
 //    "adjust": {"brightness":0*, "contrast":0*, "saturation":1*, "temperature":0*,
-//               "vibrance":0*, "gamma":1*, "sharpness":0*, "vignette":0*},
+//               "vibrance":0*, "gamma":1*, "sharpness":0*, "vignette":0*, "shadows":0*},
 //    "beauty":0*,
 //    "stylize":"none"*|pixelate|crystallize|hexagonal|twirl|bulge|bump|soft_blur|zoom_blur,
 //    "stylize_amount":0.5*,
@@ -38,6 +38,7 @@ extern NSString * const OCFilterStateDefaultsKey;
 @property (nonatomic, assign) CGFloat gamma;         // 0.2..3
 @property (nonatomic, assign) CGFloat sharpness;     // 0..1
 @property (nonatomic, assign) CGFloat vignette;      // 0..1
+@property (nonatomic, assign) CGFloat shadows;       // 0..1 shadow lift (handcam: hands next to a bright screen)
 @property (nonatomic, assign) CGFloat beauty;        // 0..1
 @property (nonatomic, copy) NSString *stylize;       // "none"...
 @property (nonatomic, assign) CGFloat stylizeAmount; // 0..1

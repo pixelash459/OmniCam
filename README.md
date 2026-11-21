@@ -25,7 +25,7 @@ No Apple developer account. The `.ipa` is `ldid` fake-signed for AppSync.
 ## End-user install (Releases)
 
 Binaries for each version live on the [Releases](https://github.com/pixelash459/OmniCam/releases) page:
-`OmniCam.ipa` and `OmniCam-PC-<ver>-Setup.exe` (current: **1.3.0**).
+`OmniCam.ipa` and `OmniCam-PC-<ver>-Setup.exe` (current: **1.4.0**).
 
 1. **Phone** — open Filza’s web server (port 2222), upload the IPA from
    `http://<phone-ip>:2222`, tap **Install**. Or copy via 3uTools / iMazing.
@@ -64,6 +64,15 @@ A copy of the IPA also sits in `dist/OmniCam.ipa` in this repo.
 - **1.3.0 networking:** keyframe bursts are paced (WebRTC-style), video is marked DSCP
   AF41 (Wi-Fi WMM Video class), and ABR also reacts to Wi-Fi queuing delay reported by
   the PC (GCC-style), so the bitrate drops before packets are lost.
+- **1.4.0 handcam screen mode:** for filming a player's phone (e.g. a PUBG Mobile
+  tournament handcam). Tap **SCREEN** on the phone or tick **Screen mode (handcam)** on the
+  PC: exposure follows the brightest part of the shot (the game screen) so it stops
+  blowing out to white, sensor video HDR is switched on, and **Shadow lift** brings the
+  hands back up. **Screen level** on the PC nudges the screen brighter or darker.
+  Tips: put a lamp on the hands (the smaller the gap between screen and hands, the
+  better both look), keep the player's screen brightness around 50–70 %, and avoid
+  auto-brightness on the player's phone.
+- The phone's bottom bar now also lays out properly in portrait.
 - Video only — use a separate mic in the meeting app.
 
 ## Troubleshooting
@@ -109,6 +118,8 @@ artifact. CI does not overwrite Releases.
 
 ## Changelog (high level)
 
+- **1.4.0** — Handcam screen mode (screen-priority exposure, video HDR, shadow lift), portrait layout fix.
+- **1.3.0** — Remote focus, full PC filter control, paced + delay-aware streaming, new icon.
 - **1.2.2** — Close-to-tray, tray menu, new app icon.
 - **1.2.1** — Virtual camera declared as BGR (fixes swapped red/blue in OBS consumers).
 - **1.2.0** — LAN discovery (Public-network firewall + probes), saved phones, redesigned PC UI; iOS filter-panel sliders and NSNull save crash.

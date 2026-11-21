@@ -93,10 +93,13 @@ working route to the PC.
 `stats` is sent by the phone every 1 s while streaming. `enc_ms` = last frame encode time.
 From 1.3.0 `stats` also carries `"batt"` (0..1, −1 unknown), `"charging"` (bool) and
 `"thermal"` (`nominal|fair|serious|critical`, from `NSProcessInfo.thermalState`).
+From 1.4.0, while screen mode is on, `stats` also carries `"exp_ms"` (shutter, ms),
+`"iso"` and `"hi"` (the metered screen level, 0..1).
 
 From 1.3.0 `welcome` also carries `"luts":[...]` (imported `.cube` names, for the PC LUT
 picker) and `"caps":["focus","luts","device_status"]`. The PC sends optional messages such
 as `focus` only when the matching cap is present (an older phone answers `nosuch`).
+1.4.0 adds the cap `"screen_mode"` (session keys `screen` / `screen_ev`, below).
 
 ### 2.3 Shared session schema
 
@@ -108,9 +111,23 @@ as `focus` only when the matching cap is present (an older phone answers `nosuch
  "kbps":3000,         // ABR ceiling when auto; live bitrate when auto=false
  "abr":true,
  "torch":false,       // ignored / forced off on front
- "zoom":1.0           // capture digital zoom, not filter geometry zoom
+ "zoom":1.0,          // capture digital zoom, not filter geometry zoom
+ "screen":false,      // 1.4.0+ handcam screen mode (cap "screen_mode")
+ "screen_ev":0.0      // 1.4.0+ -2..2 stops on the screen target
 }
 ```
+
+**Screen mode (1.4.0+).** For filming a phone screen with the player's hands
+around it. Normal auto exposure averages the scene, so a lit screen clips to white;
+lowering exposure by hand then sinks the hands. In screen mode the phone runs its
+own exposure loop in `AVCaptureExposureModeCustom`: every 3rd frame it samples the
+luma plane, takes the 99th percentile (the screen when one is in shot) and steers
+it to 0.82 of full scale (shifted by `screen_ev`). It holds a 1/60 s shutter and
+moves ISO first, so 60/120 Hz refresh and PWM dimming average out; only when ISO
+is at its minimum does the shutter get shorter. Sensor video HDR is forced on when
+the format supports it (A8 back camera at 720p/1080p). Taps then only focus. The
+hands are brought back with the filter's `adjust.shadows` (§5), which the phone and
+the PC set to 0.5 when screen mode is switched on with no lift set.
 
 Absent keys = leave unchanged. Phone clamps then replies with the **full** applied `session` (unless the incoming message was itself a phone echo — never echo).
 
@@ -180,7 +197,8 @@ Audio: intentionally NOT implemented — OmniCam is video-only; use your PC micr
             "vibrance":0.0,     // 0..1,  def 0
             "gamma":1.0,        // 0.2..3,def 1
             "sharpness":0.0,    // 0..1,  def 0
-            "vignette":0.0},    // 0..1,  def 0
+            "vignette":0.0,     // 0..1,  def 0
+            "shadows":0.0},     // 0..1,  def 0  (1.4.0+ shadow lift: tone curve, white pinned)
  "beauty":0.0,                 // 0..1 skin smoothing
  "stylize":"none|pixelate|crystallize|hexagonal|twirl|bulge|bump|soft_blur|zoom_blur",
  "stylize_amount":0.5,         // 0..1

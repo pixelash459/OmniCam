@@ -26,7 +26,7 @@ const int OCVideoPort   = 9921;
 const int OCControlPort = 9923;
 
 NSString * const OCMagicString      = @"OMNICAM1";
-NSString * const OCAppVersionString = @"1.3.0";
+NSString * const OCAppVersionString = @"1.4.0";
 
 static const NSUInteger OCMaxLineBytes = 64 * 1024; // §2 max message 64 KiB
 static const double OCAbrFloorKbps = 500.0;         // §6
@@ -744,7 +744,7 @@ static BOOL ocTcpSendAll(int fd, const uint8_t *p, size_t left) {
         @"filter" : (fs ? fs.dictionaryRepresentation : @{}) ?: @{},
         @"luts" : [OCLutLoader availableLutNames],
         // Optional features this build understands (PCs check before sending).
-        @"caps" : @[@"focus", @"luts", @"device_status"],
+        @"caps" : @[@"focus", @"luts", @"device_status", @"screen_mode"],
     }];
     id<OCNetManagerDelegate> d = _delegate;
     if (d && [d respondsToSelector:@selector(netManagerClientDidConnect:name:)]) {
@@ -1031,6 +1031,12 @@ static BOOL ocTcpSendAll(int fd, const uint8_t *p, size_t left) {
     if ([state[@"torch"] isKindOfClass:[NSNumber class]] && ce) {
         BOOL wantTorch = [state[@"torch"] boolValue] && !isFront;
         [ce applyTorchOn:wantTorch];
+    }
+    BOOL hasScreen = [state[@"screen"] isKindOfClass:[NSNumber class]];
+    BOOL hasScreenEv = [state[@"screen_ev"] isKindOfClass:[NSNumber class]];
+    if ((hasScreen || hasScreenEv) && ce) {
+        [ce setScreenMode:hasScreen ? [state[@"screen"] boolValue] : ce.screenMode
+                       ev:hasScreenEv ? [state[@"screen_ev"] doubleValue] : ce.screenEV];
     }
 
     BOOL encodeChanged = (_sessionW != oldW || _sessionH != oldH || _sessionFps != oldFps);
@@ -1385,6 +1391,8 @@ static const double OCQDelayHoldMs = 30.0;
         @"abr" : @(_abrAuto),
         @"torch" : @(torch),
         @"zoom" : @(zoom),
+        @"screen" : @(ce ? ce.screenMode : NO),
+        @"screen_ev" : @(ce ? round(ce.screenEV * 10.0) / 10.0 : 0.0),
     };
 }
 
@@ -1567,6 +1575,8 @@ static const double OCQDelayHoldMs = 30.0;
             @"sent" : @(dSent),
         } mutableCopy];
         [stats addEntriesFromDictionary:[OCNetManager deviceStatus]];
+        OCCaptureEngine *sce = sself->_captureEngine;
+        if (sce) [stats addEntriesFromDictionary:[sce exposureInfo]];
         [sself sendJson:stats];
         id<OCNetManagerDelegate> d = sself->_delegate;
         if (d && [d respondsToSelector:@selector(netManager:didUpdateStatsFps:kbps:encMs:lossPct:nacks:sent:)]) {

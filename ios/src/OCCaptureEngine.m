@@ -2,6 +2,7 @@
 //  OCCaptureEngine.m — one session, both inputs pre-created, instant switch.
 //
 #import "OCCaptureEngine.h"
+#import <QuartzCore/QuartzCore.h> // CACurrentMediaTime
 
 @interface OCCaptureEngine () <AVCaptureVideoDataOutputSampleBufferDelegate>
 @property (nonatomic, strong) AVCaptureSession *session;
@@ -18,7 +19,33 @@
 @property (nonatomic, assign) BOOL reconfiguring;            // drop frames during input swap
 @end
 
-@implementation OCCaptureEngine
+static NSString * const OCScreenModeDefaultsKey = @"omnicam.screenmode.v1";
+
+// Screen-mode metering. Luma is video range (16..235); the "highlight" is the
+// 99th percentile of a sparse sample grid, i.e. the screen when one is in shot.
+static const double OCScreenTarget = 0.82;      // highlight level to hold (0..1, gamma)
+static const double OCScreenShutterS = 1.0 / 60.0; // preferred: averages 60/120 Hz refresh + PWM
+static const double OCScreenMaxShutterS = 1.0 / 30.0;
+static const float OCScreenMaxISO = 640.0f;     // beyond this the hands are mostly noise
+
+// State for the screen-mode loop. Written on the video queue (metering) and
+// the session queue (applying); plain scalars, last-writer-wins is fine.
+typedef struct {
+    BOOL on;
+    double ev;
+    BOOL pending;    // a custom-exposure request has not reached frames yet
+    int settle;      // frames to skip after it has
+    BOOL needsSeed;  // read the device's current AE result before the first step
+    unsigned frame;
+    double duration; // seconds, last applied
+    float iso;
+    double hi;       // last highlight level
+    double lastLogS;
+} OCScreenAE;
+
+@implementation OCCaptureEngine {
+    OCScreenAE _sae;
+}
 
 // The setters below are implemented by hand, which disables clang's automatic
 // ivar synthesis for their properties — synthesize explicitly.
@@ -34,6 +61,10 @@
     _videoQueue = dispatch_queue_create("oc.capture.video", DISPATCH_QUEUE_SERIAL);
     _activeCameraId = @"back";
     _zoomFactor = 1.0;
+    NSDictionary *sm = [[NSUserDefaults standardUserDefaults] dictionaryForKey:OCScreenModeDefaultsKey];
+    _sae.on = [sm[@"on"] boolValue];
+    _sae.ev = MIN(MAX([sm[@"ev"] doubleValue], -2.0), 2.0);
+    _sae.needsSeed = YES;
 
     // Both inputs pre-created at init so switching never touches the device HAL twice.
     AVCaptureDevice *back = [self deviceAtPosition:AVCaptureDevicePositionBack];
@@ -154,7 +185,11 @@
     [_session commitConfiguration];
 
     [_session startRunning]; // blocking by design; runs on sessionQueue
-    NSLog(@"[OmniCam] capture started (preset %@, camera %@)", _session.sessionPreset, _activeCameraId);
+    AVCaptureDeviceFormat *fmt = input.device.activeFormat;
+    NSLog(@"[OmniCam] capture started (preset %@, camera %@; ISO %.0f-%.0f, shutter 1/%.0f-1/%.0f s, videoHDR %@, screen mode %@)",
+          _session.sessionPreset, _activeCameraId, fmt.minISO, fmt.maxISO,
+          1.0 / CMTimeGetSeconds(fmt.maxExposureDuration), 1.0 / CMTimeGetSeconds(fmt.minExposureDuration),
+          fmt.videoHDRSupported ? @"yes" : @"no", _sae.on ? @"on" : @"off");
     return YES;
 }
 
@@ -200,6 +235,14 @@
                     self->_session.sessionPreset = preset;
                     [self->_session commitConfiguration];
                     NSLog(@"[OmniCam] capture preset -> %@", preset);
+                    if (self->_sae.on) { // new format: HDR and our exposure start over
+                        AVCaptureDevice *dev = [self activeInput].device;
+                        if ([dev lockForConfiguration:nil]) {
+                            [self applyVideoHDRLocked:dev on:YES];
+                            [dev unlockForConfiguration];
+                        }
+                        self->_sae.needsSeed = YES;
+                    }
                 } @catch (NSException *ex) {
                     NSLog(@"[OmniCam] capture preset exception: %@", ex);
                     @try { [self->_session commitConfiguration]; } @catch (NSException *ex2) {}
@@ -244,6 +287,11 @@
     if ([device isExposureModeSupported:AVCaptureExposureModeContinuousAutoExposure]) {
         device.exposureMode = AVCaptureExposureModeContinuousAutoExposure;
     }
+    [self applyVideoHDRLocked:device on:_sae.on];
+    // Screen mode re-seeds from this device's own AE result once it settles.
+    _sae.needsSeed = YES;
+    _sae.pending = NO;
+    _sae.settle = 8;
     CGFloat maxZ = MIN(device.activeFormat.videoMaxZoomFactor, 16.0);
     device.videoZoomFactor = MIN(MAX(_zoomFactor, 1.0), maxZ);
     if (device.hasTorch && device.torchAvailable) {
@@ -398,7 +446,8 @@
             dev.focusMode = fm; // AutoFocus = focus once there, then hold
         }
         AVCaptureExposureMode em = lock ? AVCaptureExposureModeAutoExpose : AVCaptureExposureModeContinuousAutoExposure;
-        if (dev.exposurePointOfInterestSupported && [dev isExposureModeSupported:em]) {
+        // Screen mode owns exposure; a tap there only focuses.
+        if (!self->_sae.on && dev.exposurePointOfInterestSupported && [dev isExposureModeSupported:em]) {
             dev.exposurePointOfInterest = p;
             dev.exposureMode = em;
         }
@@ -426,9 +475,11 @@
         if ([dev isFocusModeSupported:AVCaptureFocusModeContinuousAutoFocus]) {
             dev.focusMode = AVCaptureFocusModeContinuousAutoFocus;
         }
-        if (dev.exposurePointOfInterestSupported) dev.exposurePointOfInterest = centre;
-        if ([dev isExposureModeSupported:AVCaptureExposureModeContinuousAutoExposure]) {
-            dev.exposureMode = AVCaptureExposureModeContinuousAutoExposure;
+        if (!self->_sae.on) {
+            if (dev.exposurePointOfInterestSupported) dev.exposurePointOfInterest = centre;
+            if ([dev isExposureModeSupported:AVCaptureExposureModeContinuousAutoExposure]) {
+                dev.exposureMode = AVCaptureExposureModeContinuousAutoExposure;
+            }
         }
         [dev unlockForConfiguration];
         self->_focusLocked = NO;
@@ -445,6 +496,165 @@
 }
 - (BOOL)isTorchOn { return _torchOn; }
 
+#pragma mark Screen mode (handcam exposure)
+
+- (BOOL)isScreenMode { return _sae.on; }
+- (double)screenEV { return _sae.ev; }
+
+- (void)setScreenMode:(BOOL)on ev:(double)ev {
+    ev = isfinite(ev) ? MIN(MAX(ev, -2.0), 2.0) : 0.0;
+    // Flags flip now so the session echo reports them; device work is queued.
+    BOOL was = _sae.on;
+    _sae.ev = ev;
+    _sae.on = on;
+    [[NSUserDefaults standardUserDefaults] setObject:@{@"on" : @(on), @"ev" : @(ev)}
+                                              forKey:OCScreenModeDefaultsKey];
+    if (on == was) return;
+    dispatch_async(_sessionQueue, ^{
+        AVCaptureDevice *dev = [self activeInput].device;
+        if (dev && [dev lockForConfiguration:nil]) {
+            [self applyVideoHDRLocked:dev on:on];
+            if (!on && [dev isExposureModeSupported:AVCaptureExposureModeContinuousAutoExposure]) {
+                dev.exposureMode = AVCaptureExposureModeContinuousAutoExposure;
+            }
+            [dev unlockForConfiguration];
+        }
+        if (on) {
+            self->_sae.needsSeed = YES;
+            self->_sae.pending = NO;
+            self->_sae.settle = 2; // let the HDR switch reach the frames first
+        }
+        NSLog(@"[OmniCam] screen mode %@ (ev %+.1f)", on ? @"on" : @"off", ev);
+    });
+}
+
+// Device must be locked. The sensor's video HDR (720p/1080p on the A8 back
+// camera) widens the range the frame can hold, which is exactly the screen vs.
+// hands problem; outside screen mode the system decides as before.
+- (void)applyVideoHDRLocked:(AVCaptureDevice *)dev on:(BOOL)on {
+    if (!dev.activeFormat.videoHDRSupported) return;
+    @try {
+        if (on) {
+            dev.automaticallyAdjustsVideoHDREnabled = NO;
+            dev.videoHDREnabled = YES;
+        } else {
+            dev.automaticallyAdjustsVideoHDREnabled = YES;
+        }
+    } @catch (NSException *ex) {
+        NSLog(@"[OmniCam] video HDR %@ failed: %@", on ? @"on" : @"off", ex);
+    }
+}
+
+- (NSDictionary *)exposureInfo {
+    if (!_sae.on || _sae.duration <= 0) return @{};
+    return @{@"exp_ms" : @(round(_sae.duration * 10000.0) / 10.0),
+             @"iso" : @(lroundf(_sae.iso)),
+             @"hi" : @(round(_sae.hi * 100.0) / 100.0)};
+}
+
+// Video queue. Samples every 8th pixel of every 8th row of the luma plane
+// (~14k samples at 720p, well under a millisecond on the A8), every 3rd frame.
+- (void)meterScreenExposure:(CVPixelBufferRef)pb {
+    if (++_sae.frame % 3 != 0) return;
+    if (_sae.pending) return;
+    if (_sae.settle > 0) { _sae.settle--; return; }
+    if (CVPixelBufferGetPlaneCount(pb) < 1) return;
+    if (CVPixelBufferLockBaseAddress(pb, kCVPixelBufferLock_ReadOnly) != kCVReturnSuccess) return;
+    const uint8_t *y = CVPixelBufferGetBaseAddressOfPlane(pb, 0);
+    size_t stride = CVPixelBufferGetBytesPerRowOfPlane(pb, 0);
+    size_t w = CVPixelBufferGetWidthOfPlane(pb, 0), h = CVPixelBufferGetHeightOfPlane(pb, 0);
+    uint32_t hist[256] = {0};
+    uint32_t n = 0;
+    if (y) {
+        for (size_t r = 4; r < h; r += 8) {
+            const uint8_t *row = y + r * stride;
+            for (size_t c = 4; c < w; c += 8) { hist[row[c]]++; n++; }
+        }
+    }
+    CVPixelBufferUnlockBaseAddress(pb, kCVPixelBufferLock_ReadOnly);
+    if (n < 100) return;
+
+    uint32_t want = n / 100, acc = 0; // top 1%
+    int p99 = 255;
+    for (; p99 > 0; p99--) { acc += hist[p99]; if (acc >= want) break; }
+    uint32_t clipped = 0;
+    for (int i = 233; i < 256; i++) clipped += hist[i];
+    double hi = MIN(MAX((p99 - 16) / 219.0, 0.0), 1.0);
+    _sae.hi = hi;
+
+    // Error in stops between the highlight and the target (both gamma-encoded,
+    // ~2.2). A clipped highlight hides how far over it is: step down hard.
+    double targetLin = MIN(pow(OCScreenTarget, 2.2) * pow(2.0, _sae.ev), pow(0.95, 2.2));
+    double step;
+    if (hi >= 0.97) {
+        step = (clipped > n / 50) ? -1.0 : -0.5;
+    } else {
+        step = log2(targetLin / MAX(pow(hi, 2.2), 1e-4)) * 0.6; // damped
+        step = MIN(MAX(step, -1.0), 0.75);
+        if (fabs(step) < 0.12) step = 0.0;
+    }
+    if (step == 0.0 && !_sae.needsSeed) return;
+    _sae.pending = YES;
+    dispatch_async(_sessionQueue, ^{ [self applyScreenExposureStep:step]; });
+}
+
+// Session queue. Turns an exposure change (stops) into shutter + ISO.
+- (void)applyScreenExposureStep:(double)step {
+    AVCaptureDevice *dev = [self activeInput].device;
+    if (!_sae.on || !dev || _reconfiguring
+        || ![dev isExposureModeSupported:AVCaptureExposureModeCustom]) {
+        _sae.pending = NO;
+        return;
+    }
+    AVCaptureDeviceFormat *fmt = dev.activeFormat;
+    double dMin = CMTimeGetSeconds(fmt.minExposureDuration);
+    double dMax = MIN(CMTimeGetSeconds(fmt.maxExposureDuration), OCScreenMaxShutterS);
+    float isoMin = fmt.minISO, isoMax = MIN(fmt.maxISO, OCScreenMaxISO);
+    if (_sae.needsSeed || _sae.duration <= 0 || _sae.iso <= 0) {
+        _sae.duration = CMTimeGetSeconds(dev.exposureDuration);
+        _sae.iso = dev.ISO;
+        _sae.needsSeed = NO;
+        if (!(_sae.duration > 0) || !(_sae.iso > 0)) { _sae.duration = OCScreenShutterS; _sae.iso = isoMin; }
+    }
+    // Total exposure, then split it: shutter at 1/60 s where possible, ISO
+    // takes the rest; only once ISO bottoms out does the shutter get shorter.
+    double product = _sae.duration * _sae.iso * pow(2.0, step);
+    product = MIN(MAX(product, dMin * isoMin), dMax * isoMax);
+    double d = MIN(MAX(OCScreenShutterS, dMin), dMax);
+    double iso = product / d;
+    if (iso < isoMin) { iso = isoMin; d = MAX(product / iso, dMin); }
+    else if (iso > isoMax) { iso = isoMax; d = MIN(product / iso, dMax); }
+
+    // Pinned at a limit (dark room at max, or min ISO at the shortest shutter):
+    // nothing to change, so do not keep re-sending the same request.
+    if (dev.exposureMode == AVCaptureExposureModeCustom
+        && fabs(d - _sae.duration) < 1e-6 && fabs(iso - _sae.iso) < 0.5) {
+        _sae.pending = NO;
+        _sae.settle = 3;
+        return;
+    }
+    NSError *err = nil;
+    if (![dev lockForConfiguration:&err]) { _sae.pending = NO; return; }
+    _sae.duration = d;
+    _sae.iso = (float)iso;
+    [dev setExposureModeCustomWithDuration:CMTimeMakeWithSeconds(d, 1000000)
+                                       ISO:(float)iso
+                         completionHandler:^(CMTime syncTime) {
+        (void)syncTime;
+        dispatch_async(self->_videoQueue, ^{
+            self->_sae.pending = NO;
+            self->_sae.settle = 1; // one more metering slot before judging
+        });
+    }];
+    [dev unlockForConfiguration];
+
+    double now = CACurrentMediaTime();
+    if (now - _sae.lastLogS > 2.0) {
+        _sae.lastLogS = now;
+        NSLog(@"[OmniCam] screen AE: hi %.2f step %+.2f -> 1/%.0f s ISO %.0f", _sae.hi, step, 1.0 / d, iso);
+    }
+}
+
 #pragma mark Frame delivery
 
 - (void)captureOutput:(AVCaptureOutput *)output
@@ -456,6 +666,7 @@ didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
     CVPixelBufferRef pb = CMSampleBufferGetImageBuffer(sampleBuffer);
     if (!pb) return;
     CMTime ts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer);
+    if (_sae.on) [self meterScreenExposure:pb];
     // Called on _videoQueue; the delegate (filter pipeline) does its own retain + async hop.
     [d captureEngine:self didOutputPixelBuffer:pb timestamp:ts];
 }
